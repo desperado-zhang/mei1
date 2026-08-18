@@ -11,6 +11,267 @@ class EgoBrowserError(RuntimeError):
     pass
 
 
+_DETAIL_CAPTURE_HELPERS_JS = r"""
+    const getOptionalService = (name) => {
+      try { return injector.get(name); } catch (e) { return null; }
+    };
+    const apiCard = getOptionalService('api.card');
+    const apiMarketing = getOptionalService('api.marketing');
+    const detailState = { memberOverviewPermissionDenied: false };
+    const pageSizeForDetails = 100;
+    const toSourceId = (value) => String(value);
+    const toRequestId = (value) => /^\d+$/.test(String(value)) ? Number(value) : value;
+    const rowsFrom = (payload) => {
+      const data = payload && Object.prototype.hasOwnProperty.call(payload, 'data') ? payload.data : payload;
+      const walk = (value) => {
+        if (Array.isArray(value)) return value.filter((item) => item && typeof item === 'object');
+        if (!value || typeof value !== 'object') return [];
+        for (const key of ['rows', 'list', 'records', 'items', 'data']) {
+          const child = value[key];
+          const rows = walk(child);
+          if (rows.length) return rows;
+        }
+        return [];
+      };
+      return walk(data);
+    };
+    const totalFrom = (payload) => {
+      const stack = [payload];
+      while (stack.length) {
+        const value = stack.pop();
+        if (!value || typeof value !== 'object') continue;
+        for (const key of ['total', 'totalCount', 'count', 'recordsTotal']) {
+          const raw = value[key];
+          if (Number.isFinite(raw)) return Number(raw);
+          if (typeof raw === 'string' && /^\d+$/.test(raw)) return Number(raw);
+        }
+        for (const child of Object.values(value)) {
+          if (child && typeof child === 'object') stack.push(child);
+        }
+      }
+      return null;
+    };
+    const pushPayload = (method, endpoint, requestUrl, requestParams, requestBody, responseJson) => {
+      payloads.push({
+        method,
+        endpoint,
+        requestUrl,
+        requestParams: requestParams || {},
+        requestBody: requestBody === undefined ? null : requestBody,
+        statusCode: 200,
+        responseJson
+      });
+    };
+    const callOnce = async (method, endpoint, requestUrl, requestParams, requestBody, fn, options = {}) => {
+      try {
+        const responseJson = await fn();
+        pushPayload(method, endpoint, requestUrl, requestParams, requestBody, responseJson);
+        return responseJson;
+      } catch (e) {
+        const error = serializeError(e);
+        const permissionDenied = isPermissionError(error);
+        errors.push({ endpoint, permissionDenied, error });
+        if (options.markOverviewDenied && permissionDenied) {
+          detailState.memberOverviewPermissionDenied = true;
+        }
+        return null;
+      }
+    };
+    const callPaged = async ({ method = 'POST', endpoint, requestUrl, makeBody, fn, maxPages = 50 }) => {
+      for (let page = 1; page <= maxPages; page++) {
+        const requestBody = makeBody(page, pageSizeForDetails);
+        let responseJson = null;
+        try {
+          responseJson = await fn(requestBody);
+          pushPayload(method, endpoint, requestUrl, {}, requestBody, responseJson);
+        } catch (e) {
+          const error = serializeError(e);
+          errors.push({ endpoint, permissionDenied: isPermissionError(error), error });
+          break;
+        }
+        const rows = rowsFrom(responseJson);
+        const total = totalFrom(responseJson);
+        if (!total || rows.length === 0 || page * pageSizeForDetails >= total) break;
+      }
+    };
+    const queryRequest = (memberId, type, page, size, includeStore = false) => ({
+      page,
+      size,
+      query: [
+        { field: 'merchantId', value: mch.mch_id },
+        { field: 'memberId', value: toRequestId(memberId) },
+        { field: 'type', value: String(type) },
+        ...(includeStore ? [{ field: 'storeId', value: mch.store_id }] : [])
+      ]
+    });
+    const accountRequest = (memberId, type, status, page, size) => ({
+      page,
+      size,
+      query: [
+        { field: 'merchantId', value: mch.mch_id },
+        { field: 'memberId', value: toRequestId(memberId) },
+        { field: 'type', value: String(type) },
+        { field: 'status', value: status }
+      ]
+    });
+    const merchantMemberQuery = (memberId, page, size) => ({
+      page,
+      size,
+      query: [
+        { field: 'merchantId', value: mch.mch_id },
+        { field: 'memberId', value: toRequestId(memberId) }
+      ]
+    });
+    const captureMemberDetailPayloads = async (memberId, includeAssetOverview) => {
+      const memberRequestId = toRequestId(memberId);
+      await callOnce('GET', '/api/member/detailInfo/' + memberId, 'ego-service://api.member.memberInfo/' + memberId, null, null, () => api.memberInfo(memberId));
+      await callOnce('GET', '/api/member/detail/' + memberId, 'ego-service://api.member.memberDetailOfBooking/' + memberId, null, null, () => api.memberDetailOfBooking(memberId));
+      if (typeof api.userInfo === 'function') {
+        await callOnce('GET', '/api/member/' + memberId, 'ego-service://api.member.userInfo/' + memberId, null, null, () => api.userInfo(memberId));
+      }
+      if (typeof api.getMemberAttr === 'function') {
+        await callOnce('GET', '/api/member/memberAttr/' + memberId, 'ego-service://api.member.getMemberAttr/' + memberId, null, null, () => api.getMemberAttr(memberId));
+      }
+      if (typeof api.memberUsreInfo === 'function') {
+        await callOnce('GET', '/api/storePartnerAccount/queryByMemberId/' + memberId, 'ego-service://api.member.memberUsreInfo/' + memberId, null, null, () => api.memberUsreInfo(memberId));
+      }
+      if (typeof api.getMemberConsumeValue === 'function') {
+        await callOnce('GET', '/api/member/queryMemberRemainConsumeValue/' + memberId, 'ego-service://api.member.getMemberConsumeValue/' + memberId, null, null, () => api.getMemberConsumeValue(memberId));
+      }
+      if (includeAssetOverview && !detailState.memberOverviewPermissionDenied) {
+        await callOnce(
+          'GET',
+          '/api/member/amount/' + memberId,
+          'ego-service://api.member.memberOverview/' + memberId,
+          { storeIds },
+          null,
+          () => api.memberOverview(memberId, storeIds),
+          { markOverviewDenied: true }
+        );
+      }
+
+      await callPaged({
+        endpoint: '/api/member/list/cardAndPresent',
+        requestUrl: 'ego-service://api.member.cardList/held_card/' + memberId,
+        makeBody: (page, size) => accountRequest(memberId, 1, 2, page, size),
+        fn: (body) => api.cardList(body)
+      });
+      await callPaged({
+        endpoint: '/api/member/list/cardAndPresent',
+        requestUrl: 'ego-service://api.member.cardList/coupon/' + memberId,
+        makeBody: (page, size) => accountRequest(memberId, 2, 1, page, size),
+        fn: (body) => api.cardList(body)
+      });
+      await callPaged({
+        endpoint: '/api/member/list/cardAndPresent',
+        requestUrl: 'ego-service://api.member.cardList/present/' + memberId,
+        makeBody: (page, size) => accountRequest(memberId, 3, 1, page, size),
+        fn: (body) => api.cardList(body)
+      });
+      if (typeof api.memberCouponSearch === 'function') {
+        await callPaged({
+          endpoint: '/api/couponUser/memberCouponSearch',
+          requestUrl: 'ego-service://api.member.memberCouponSearch/' + memberId,
+          makeBody: (page, size) => merchantMemberQuery(memberId, page, size),
+          fn: (body) => api.memberCouponSearch(body)
+        });
+      }
+      if (apiCard && typeof apiCard.cardPresentsList === 'function') {
+        await callPaged({
+          endpoint: '/api/giveTradeRecord/giveFirendSearch',
+          requestUrl: 'ego-service://api.card.cardPresentsList/' + memberId,
+          makeBody: (page, size) => merchantMemberQuery(memberId, page, size),
+          fn: (body) => apiCard.cardPresentsList(body)
+        });
+      }
+      if (typeof api.getProductDepositList === 'function') {
+        await callPaged({
+          endpoint: '/api/deposit/depositStock/searchStockListData',
+          requestUrl: 'ego-service://api.member.getProductDepositList/' + memberId,
+          makeBody: (page, size) => ({ merchantId: mch.mch_id, memberId: memberRequestId, size, page }),
+          fn: (body) => api.getProductDepositList(body)
+        });
+      }
+
+      if (typeof api.memberServiceList === 'function') {
+        await callPaged({
+          endpoint: '/api/wechatbusinessassists/memberServiceList',
+          requestUrl: 'ego-service://api.member.memberServiceList/' + memberId,
+          makeBody: (page, size) => ({ merchantId: mch.mch_id, memberId: memberRequestId, page, rows: size, queryParams: {} }),
+          fn: (body) => api.memberServiceList(body)
+        });
+      }
+
+      for (const item of [
+        [1, true],
+        [2, false],
+        [4, true],
+        [5, true],
+        [6, true]
+      ]) {
+        const [type, includeStore] = item;
+        await callPaged({
+          endpoint: '/api/member/list/record',
+          requestUrl: 'ego-service://api.member.recordList/type-' + type + '/' + memberId,
+          makeBody: (page, size) => queryRequest(memberId, type, page, size, includeStore),
+          fn: (body) => api.recordList(body)
+        });
+      }
+      if (typeof api.pointsChangeRecord === 'function') {
+        await callPaged({
+          endpoint: '/api/pointsChangeRecord/search',
+          requestUrl: 'ego-service://api.member.pointsChangeRecord/' + memberId,
+          makeBody: (page, size) => merchantMemberQuery(memberId, page, size),
+          fn: (body) => api.pointsChangeRecord(body)
+        });
+      }
+      if (typeof api.mallMemberTrade === 'function') {
+        await callPaged({
+          endpoint: '/api/mallItemTrade/mallMemberTrade',
+          requestUrl: 'ego-service://api.member.mallMemberTrade/' + memberId,
+          makeBody: (page, size) => ({ page, size, memberId: memberRequestId }),
+          fn: (body) => api.mallMemberTrade(body)
+        });
+      }
+      if (apiMarketing && typeof apiMarketing.faceBrushFaceRecord === 'function') {
+        await callPaged({
+          endpoint: '/api/dragonflyBrushFace/brushFaceRecord',
+          requestUrl: 'ego-service://api.marketing.faceBrushFaceRecord/' + memberId,
+          makeBody: (page, size) => ({ page, size, query: [{ field: 'holderId', value: memberRequestId }] }),
+          fn: (body) => apiMarketing.faceBrushFaceRecord(body)
+        });
+      }
+      if (typeof api.reachStoreRecord === 'function') {
+        await callPaged({
+          endpoint: '/api/member/reachStore/record',
+          requestUrl: 'ego-service://api.member.reachStoreRecord/' + memberId,
+          makeBody: (page, size) => ({ page, size, memberId: memberRequestId }),
+          fn: (body) => api.reachStoreRecord(body)
+        });
+      }
+      if (typeof api.getProductDepositRecordData === 'function') {
+        await callPaged({
+          endpoint: '/api/deposit/depositOperateRecord/searchRecordListData',
+          requestUrl: 'ego-service://api.member.getProductDepositRecordData/' + memberId,
+          makeBody: (page, size) => ({ page, size, memberId: memberRequestId }),
+          fn: (body) => api.getProductDepositRecordData(body)
+        });
+      }
+
+      if (typeof api.memberSurveys === 'function') {
+        await callOnce('GET', '/api/memberSurveys/profile/' + memberId, 'ego-service://api.member.memberSurveys/' + memberId, null, null, () => api.memberSurveys(memberId));
+      }
+      if (typeof api.memberSurveyRecordData === 'function') {
+        const body = { queryData: 'merchantCustomerFormList', merchantId: mch.mch_id, memberId: memberRequestId };
+        await callOnce('POST', '/api/tduckDataProxy/query', 'ego-service://api.member.memberSurveyRecordData/' + memberId, {}, body, () => api.memberSurveyRecordData(body));
+      }
+      if (typeof api.getStorePartnerByMemberId === 'function') {
+        await callOnce('GET', '/api/storePartner/getStorePartnerByMemberId/' + memberId, 'ego-service://api.member.getStorePartnerByMemberId/' + memberId, null, null, () => api.getStorePartnerByMemberId(memberId));
+      }
+    };
+"""
+
+
 def capture_with_ego(
     *,
     task_space: str | int | None,
@@ -158,7 +419,7 @@ const result = await js(String.raw`(async () => {{
     const payloads = [];
     const errors = [];
     const seenDetailMemberIds = new Set();
-    let memberOverviewPermissionDenied = false;
+{_DETAIL_CAPTURE_HELPERS_JS}
 
     for (let pageNo = {start_page}; pageNo <= {end_page}; pageNo++) {{
       const listRequest = {{
@@ -188,34 +449,7 @@ const result = await js(String.raw`(async () => {{
         if (!memberId || seenDetailMemberIds.has(String(memberId))) continue;
         seenDetailMemberIds.add(String(memberId));
 
-        const calls = [
-          ['GET', '/api/member/detailInfo/' + memberId, 'ego-service://api.member.memberInfo/' + memberId, null, () => api.memberInfo(memberId)],
-          ['GET', '/api/member/detail/' + memberId, 'ego-service://api.member.memberDetailOfBooking/' + memberId, null, () => api.memberDetailOfBooking(memberId)]
-        ];
-        if ({str(include_asset_overview).lower()} && !memberOverviewPermissionDenied) {{
-          calls.push(['GET', '/api/member/amount/' + memberId, 'ego-service://api.member.memberOverview/' + memberId, {{ storeIds }}, () => api.memberOverview(memberId, storeIds)]);
-        }}
-
-        for (const [method, endpoint, requestUrl, requestParams, fn] of calls) {{
-          try {{
-            const responseJson = await fn();
-            payloads.push({{
-              method,
-              endpoint,
-              requestUrl,
-              requestParams: requestParams || {{}},
-              requestBody: null,
-              statusCode: 200,
-              responseJson
-            }});
-          }} catch (e) {{
-            const error = serializeError(e);
-            errors.push({{ endpoint, permissionDenied: isPermissionError(error), error }});
-            if (endpoint.includes('/api/member/amount/') && isPermissionError(error)) {{
-              memberOverviewPermissionDenied = true;
-            }}
-          }}
-        }}
+        await captureMemberDetailPayloads(memberId, {str(include_asset_overview).lower()});
       }}
     }}
 
@@ -307,37 +541,10 @@ const result = await js(String.raw`(async () => {{
     const storeIds = '-1,' + mch.store_id;
     const payloads = [];
     const errors = [];
-    let memberOverviewPermissionDenied = false;
+{_DETAIL_CAPTURE_HELPERS_JS}
 
     for (const memberId of memberIds) {{
-      const calls = [
-        ['GET', '/api/member/detailInfo/' + memberId, 'ego-service://api.member.memberInfo/' + memberId, null, () => api.memberInfo(memberId)],
-        ['GET', '/api/member/detail/' + memberId, 'ego-service://api.member.memberDetailOfBooking/' + memberId, null, () => api.memberDetailOfBooking(memberId)]
-      ];
-      if ({str(include_asset_overview).lower()} && !memberOverviewPermissionDenied) {{
-        calls.push(['GET', '/api/member/amount/' + memberId, 'ego-service://api.member.memberOverview/' + memberId, {{ storeIds }}, () => api.memberOverview(memberId, storeIds)]);
-      }}
-
-      for (const [method, endpoint, requestUrl, requestParams, fn] of calls) {{
-        try {{
-          const responseJson = await fn();
-          payloads.push({{
-            method,
-            endpoint,
-            requestUrl,
-            requestParams: requestParams || {{}},
-            requestBody: null,
-            statusCode: 200,
-            responseJson
-          }});
-        }} catch (e) {{
-          const error = serializeError(e);
-          errors.push({{ endpoint, permissionDenied: isPermissionError(error), error }});
-          if (endpoint.includes('/api/member/amount/') && isPermissionError(error)) {{
-            memberOverviewPermissionDenied = true;
-          }}
-        }}
-      }}
+      await captureMemberDetailPayloads(memberId, {str(include_asset_overview).lower()});
     }}
 
     return JSON.stringify({{

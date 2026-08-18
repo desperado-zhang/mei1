@@ -683,6 +683,203 @@ class Database:
         self.conn.commit()
         return int(row["id"])
 
+    def save_service_record(self, record: dict[str, Any]) -> int:
+        columns = [
+            "member_id",
+            "source_record_id",
+            "record_type",
+            "record_at",
+            "employee_id",
+            "employee_name",
+            "content",
+            "related_items_text",
+            "record_hash",
+            "raw_json",
+        ]
+        self.conn.execute(
+            f"""
+            INSERT INTO member_service_records ({", ".join(columns)})
+            VALUES ({", ".join("?" for _ in columns)})
+            ON CONFLICT(member_id, record_hash) DO UPDATE SET
+              source_record_id = COALESCE(excluded.source_record_id, member_service_records.source_record_id),
+              record_type = excluded.record_type,
+              record_at = COALESCE(excluded.record_at, member_service_records.record_at),
+              employee_id = COALESCE(excluded.employee_id, member_service_records.employee_id),
+              employee_name = COALESCE(excluded.employee_name, member_service_records.employee_name),
+              content = COALESCE(excluded.content, member_service_records.content),
+              related_items_text = COALESCE(excluded.related_items_text, member_service_records.related_items_text),
+              raw_json = COALESCE(excluded.raw_json, member_service_records.raw_json),
+              last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            """,
+            [self._db_value(record.get(column)) for column in columns],
+        )
+        row = self.conn.execute(
+            """
+            SELECT id FROM member_service_records
+            WHERE member_id = ? AND record_hash = ?
+            """,
+            (record["member_id"], record["record_hash"]),
+        ).fetchone()
+        self.conn.commit()
+        return int(row["id"])
+
+    def save_detail_record(self, record: dict[str, Any]) -> int:
+        columns = [
+            "member_id",
+            "category",
+            "source_record_id",
+            "happened_at",
+            "title",
+            "status",
+            "amount_cents",
+            "store_id",
+            "store_name",
+            "employee_id",
+            "employee_name",
+            "room_name",
+            "content",
+            "order_no",
+            "duration_minutes",
+            "record_hash",
+            "raw_json",
+        ]
+        self.conn.execute(
+            f"""
+            INSERT INTO member_detail_records ({", ".join(columns)})
+            VALUES ({", ".join("?" for _ in columns)})
+            ON CONFLICT(member_id, category, record_hash) DO UPDATE SET
+              source_record_id = COALESCE(excluded.source_record_id, member_detail_records.source_record_id),
+              happened_at = COALESCE(excluded.happened_at, member_detail_records.happened_at),
+              title = COALESCE(excluded.title, member_detail_records.title),
+              status = COALESCE(excluded.status, member_detail_records.status),
+              amount_cents = COALESCE(excluded.amount_cents, member_detail_records.amount_cents),
+              store_id = COALESCE(excluded.store_id, member_detail_records.store_id),
+              store_name = COALESCE(excluded.store_name, member_detail_records.store_name),
+              employee_id = COALESCE(excluded.employee_id, member_detail_records.employee_id),
+              employee_name = COALESCE(excluded.employee_name, member_detail_records.employee_name),
+              room_name = COALESCE(excluded.room_name, member_detail_records.room_name),
+              content = COALESCE(excluded.content, member_detail_records.content),
+              order_no = COALESCE(excluded.order_no, member_detail_records.order_no),
+              duration_minutes = COALESCE(excluded.duration_minutes, member_detail_records.duration_minutes),
+              raw_json = COALESCE(excluded.raw_json, member_detail_records.raw_json),
+              last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            """,
+            [self._db_value(record.get(column)) for column in columns],
+        )
+        row = self.conn.execute(
+            """
+            SELECT id FROM member_detail_records
+            WHERE member_id = ? AND category = ? AND record_hash = ?
+            """,
+            (record["member_id"], record["category"], record["record_hash"]),
+        ).fetchone()
+        self.conn.commit()
+        return int(row["id"])
+
+    def save_survey_profile(self, profile: dict[str, Any]) -> int:
+        columns = [
+            "member_id",
+            "source_profile_id",
+            "profile_name",
+            "profile_url",
+            "field_values_json",
+            "raw_json",
+        ]
+        self.conn.execute(
+            f"""
+            INSERT INTO member_survey_profiles ({", ".join(columns)})
+            VALUES ({", ".join("?" for _ in columns)})
+            ON CONFLICT(member_id, source_profile_id) DO UPDATE SET
+              profile_name = COALESCE(excluded.profile_name, member_survey_profiles.profile_name),
+              profile_url = COALESCE(excluded.profile_url, member_survey_profiles.profile_url),
+              field_values_json = COALESCE(excluded.field_values_json, member_survey_profiles.field_values_json),
+              raw_json = COALESCE(excluded.raw_json, member_survey_profiles.raw_json),
+              last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            """,
+            [self._db_value(profile.get(column)) for column in columns],
+        )
+        row = self.conn.execute(
+            """
+            SELECT id FROM member_survey_profiles
+            WHERE member_id = ? AND source_profile_id = ?
+            """,
+            (profile["member_id"], profile["source_profile_id"]),
+        ).fetchone()
+        self.conn.commit()
+        return int(row["id"])
+
+    def save_attachment(self, attachment: dict[str, Any]) -> int:
+        columns = [
+            "member_id",
+            "source_file_id",
+            "file_name",
+            "content_type",
+            "file_url_hash",
+            "note",
+            "uploaded_at",
+            "raw_json",
+        ]
+        self.conn.execute(
+            f"""
+            INSERT INTO member_attachments ({", ".join(columns)})
+            VALUES ({", ".join("?" for _ in columns)})
+            ON CONFLICT(member_id, source_file_id) DO UPDATE SET
+              file_name = COALESCE(excluded.file_name, member_attachments.file_name),
+              content_type = COALESCE(excluded.content_type, member_attachments.content_type),
+              file_url_hash = COALESCE(excluded.file_url_hash, member_attachments.file_url_hash),
+              note = COALESCE(excluded.note, member_attachments.note),
+              uploaded_at = COALESCE(excluded.uploaded_at, member_attachments.uploaded_at),
+              raw_json = COALESCE(excluded.raw_json, member_attachments.raw_json),
+              last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            """,
+            [self._db_value(attachment.get(column)) for column in columns],
+        )
+        row = self.conn.execute(
+            """
+            SELECT id FROM member_attachments
+            WHERE member_id = ? AND source_file_id = ?
+            """,
+            (attachment["member_id"], attachment["source_file_id"]),
+        ).fetchone()
+        self.conn.commit()
+        return int(row["id"])
+
+    def save_partner_info(self, info: dict[str, Any]) -> int:
+        columns = [
+            "member_id",
+            "partner_member_id",
+            "partner_level",
+            "store_balance_cents",
+            "withdrawable_cents",
+            "direct_referrer_name",
+            "indirect_referrer_name",
+            "raw_json",
+        ]
+        self.conn.execute(
+            f"""
+            INSERT INTO member_partner_infos ({", ".join(columns)})
+            VALUES ({", ".join("?" for _ in columns)})
+            ON CONFLICT(member_id, partner_member_id) DO UPDATE SET
+              partner_level = COALESCE(excluded.partner_level, member_partner_infos.partner_level),
+              store_balance_cents = COALESCE(excluded.store_balance_cents, member_partner_infos.store_balance_cents),
+              withdrawable_cents = COALESCE(excluded.withdrawable_cents, member_partner_infos.withdrawable_cents),
+              direct_referrer_name = COALESCE(excluded.direct_referrer_name, member_partner_infos.direct_referrer_name),
+              indirect_referrer_name = COALESCE(excluded.indirect_referrer_name, member_partner_infos.indirect_referrer_name),
+              raw_json = COALESCE(excluded.raw_json, member_partner_infos.raw_json),
+              last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            """,
+            [self._db_value(info.get(column)) for column in columns],
+        )
+        row = self.conn.execute(
+            """
+            SELECT id FROM member_partner_infos
+            WHERE member_id = ? AND partner_member_id = ?
+            """,
+            (info["member_id"], info["partner_member_id"]),
+        ).fetchone()
+        self.conn.commit()
+        return int(row["id"])
+
     def find_member_id(
         self,
         *,
@@ -724,6 +921,11 @@ class Database:
             "member_list_observations",
             "member_asset_snapshots",
             "member_account_items",
+            "member_service_records",
+            "member_detail_records",
+            "member_survey_profiles",
+            "member_attachments",
+            "member_partner_infos",
             "member_sync_states",
             "member_change_events",
         ]

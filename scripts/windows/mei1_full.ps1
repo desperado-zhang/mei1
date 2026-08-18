@@ -20,9 +20,9 @@ Enable-Mei1CondaEnv -EnvName $CondaEnv
 $resolvedTaskSpace = Get-Mei1Setting -Value $TaskSpace -EnvName "MEI1_EGO_TASK_SPACE" -Default "35"
 $resolvedStartPage = Get-Mei1IntSetting -Value $StartPage -EnvName "MEI1_FULL_START_PAGE" -Default 1
 $resolvedEndPage = Get-Mei1IntSetting -Value $EndPage -EnvName "MEI1_FULL_END_PAGE" -Default 126
-$resolvedWindowPages = Get-Mei1IntSetting -Value $WindowPages -EnvName "MEI1_FULL_WINDOW_PAGES" -Default 3
-$resolvedDetailPerPage = Get-Mei1IntSetting -Value $DetailPerPage -EnvName "MEI1_FULL_DETAIL_PER_PAGE" -Default 2
-$resolvedTimeout = Get-Mei1IntSetting -Value $TimeoutSeconds -EnvName "MEI1_EGO_TIMEOUT" -Default 240
+$resolvedWindowPages = Get-Mei1IntSetting -Value $WindowPages -EnvName "MEI1_FULL_WINDOW_PAGES" -Default 1
+$resolvedDetailPerPage = Get-Mei1IntSetting -Value $DetailPerPage -EnvName "MEI1_FULL_DETAIL_PER_PAGE" -Default 20
+$resolvedTimeout = Get-Mei1IntSetting -Value $TimeoutSeconds -EnvName "MEI1_EGO_TIMEOUT" -Default 900
 
 Ensure-Mei1LogDir -ProjectDir $root | Out-Null
 

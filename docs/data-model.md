@@ -50,13 +50,23 @@ Use it for intercepted APIs such as:
 - `POST /api/member/list/search`
 - `GET /api/member/detailInfo/{memberId}`
 - `GET /api/member/detail/{memberId}`
-- `POST /api/member/list/cardAndPresent`
-- `POST /api/member/list/record`
-- `GET /api/member/amount/{memberId}`
-- `POST /api/member/reachStore/record`
-- `POST /api/member/consumeTotal`
+- `GET /api/member/{memberId}`
 - `GET /api/member/memberAttr/{memberId}`
+- `GET /api/member/queryMemberRemainConsumeValue/{memberId}`
+- `POST /api/member/list/cardAndPresent`
+- `POST /api/couponUser/memberCouponSearch`
+- `POST /api/giveTradeRecord/giveFirendSearch`
+- `POST /api/deposit/depositStock/searchStockListData`
+- `POST /api/wechatbusinessassists/memberServiceList`
+- `POST /api/member/list/record`
+- `GET /api/member/amount/{memberId}` when authorized
+- `POST /api/pointsChangeRecord/search`
+- `POST /api/mallItemTrade/mallMemberTrade`
+- `POST /api/dragonflyBrushFace/brushFaceRecord`
+- `POST /api/member/reachStore/record`
+- `POST /api/deposit/depositOperateRecord/searchRecordListData`
 - `GET /api/memberSurveys/profile/{memberId}`
+- `POST /api/tduckDataProxy/query`
 
 ### `list_pages`
 
@@ -112,7 +122,14 @@ Rows are deduplicated by `(member_id, snapshot_hash)`.
 
 Cards, coupons, gifts, mall coupons, transferred items, and deposit items from the `会员帐户` tab.
 
-The current implementation extracts held cards from `GET /api/member/detailInfo/{memberId}` at `data.cards` and stores them as `item_scope = held_card`. Balance-like source fields can mean either times or money, so v1 preserves the display text and raw JSON, and only fills `balance_cents` when the source category indicates a stored-value card.
+The ego-lite implementation calls the visible account sub-tab APIs directly and paginates them:
+
+- `held_card`, `coupon`, `present`: `POST /api/member/list/cardAndPresent`
+- `mall_coupon`: `POST /api/couponUser/memberCouponSearch`
+- `transferred`: `POST /api/giveTradeRecord/giveFirendSearch`
+- `deposit_item`: `POST /api/deposit/depositStock/searchStockListData`
+
+Balance-like source fields can mean either times or money, so v1 preserves the display text and raw JSON, and only fills `balance_cents` when the source category indicates a stored-value card.
 
 Use `item_scope` to distinguish:
 
@@ -133,6 +150,8 @@ Records from `服务记录`:
 - `other`
 
 Deduplication uses `(member_id, record_hash)` so rows without source IDs can still be stable.
+
+The service-record endpoint name contains `wechatbusinessassists`, but it is the customer service-record tab, not WeChat chat history. Chat/conversation/message endpoints remain excluded.
 
 ### `member_detail_records`
 

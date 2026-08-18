@@ -1,8 +1,8 @@
 # 美问客户采集工具
 
-本项目用于从美问 SaaS 顾客列表页采集客户列表、客户详情抽屉和账户卡项等数据，落地到本地 SQLite，并提供一个本地只读客户浏览页面。
+本项目用于从美问 SaaS 顾客列表页采集客户列表、客户详情抽屉和账户/服务/记录等可见 tab 数据，落地到本地 SQLite，并提供一个本地只读客户浏览页面。
 
-默认数据范围是客户列表和客户详情。微信聊天内容不采集，附件文件不下载，手机号不以明文作为默认存储字段。
+默认数据范围是客户列表和客户详情中已授权可见的数据。微信聊天内容不采集，附件文件不下载，手机号不以明文作为默认存储字段。
 
 ## 项目架构
 
@@ -44,8 +44,9 @@ flowchart LR
 - `member_sync_states`：增量同步基线，保存客户列表稳定哈希。
 - `member_change_events`：增量扫描发现的新客户或变更客户。
 - `member_asset_snapshots`：客户钱包、积分、消费、到店等资产类快照。
-- `member_account_items`：会员账户中的卡、券、赠送项目等。
-- `member_service_records`、`member_detail_records`：服务记录和顾客数据明细。
+- `member_account_items`：会员账户中的卡、券、赠送、商城优惠券、已转赠、寄存品项等。
+- `member_service_records`、`member_detail_records`：服务记录和顾客数据明细二级 tab。
+- `member_survey_profiles`、`member_attachments`、`member_partner_infos`：问卷、附件元数据、合伙人信息；空态不插入记录。
 
 ## 页面地址
 
@@ -164,8 +165,9 @@ mei1-crawler crawl-ego-batch \
   --task-space 35 \
   --start-page 1 \
   --end-page 126 \
-  --window-pages 3 \
-  --detail-per-page 2
+  --window-pages 1 \
+  --detail-per-page 20 \
+  --timeout 900
 ```
 
 重建增量同步基线：
@@ -284,8 +286,9 @@ mei1-crawler crawl-ego-batch \
   --task-space 35 \
   --start-page 1 \
   --end-page 126 \
-  --window-pages 3 \
-  --detail-per-page 2
+  --window-pages 1 \
+  --detail-per-page 20 \
+  --timeout 900
 mei1-crawler rebuild-sync-state
 
 while true; do
@@ -307,14 +310,14 @@ done
 | `MEI1_EGO_TASK_SPACE` | `35` | 已登录 ego-lite 任务空间 |
 | `MEI1_FULL_START_PAGE` | `1` | 全量采集起始页 |
 | `MEI1_FULL_END_PAGE` | `126` | 全量采集结束页 |
-| `MEI1_FULL_WINDOW_PAGES` | `3` | 全量采集每个窗口的页数 |
-| `MEI1_FULL_DETAIL_PER_PAGE` | `2` | 全量采集每页拉取详情数量 |
+| `MEI1_FULL_WINDOW_PAGES` | `1` | 全量采集每个窗口的页数 |
+| `MEI1_FULL_DETAIL_PER_PAGE` | `20` | 全量采集每页拉取详情数量；等于默认列表页大小时会抓该页全部详情 |
 | `MEI1_INCREMENTAL_START_PAGE` | `1` | 增量扫描起始页 |
 | `MEI1_INCREMENTAL_PAGES` | `3` | 增量扫描页数 |
 | `MEI1_INCREMENTAL_WINDOW_PAGES` | `3` | 增量扫描每个窗口的页数 |
 | `MEI1_DETAIL_BATCH_SIZE` | `10` | 增量详情拉取批大小 |
 | `MEI1_INCREMENTAL_INTERVAL_SECONDS` | `600` | 常驻循环间隔秒数 |
-| `MEI1_EGO_TIMEOUT` | `240` | ego-lite 单窗口超时时间 |
+| `MEI1_EGO_TIMEOUT` | `900` | ego-lite 单窗口超时时间；增量脚本仍可用较小值 |
 
 ## 数据目录和安全边界
 

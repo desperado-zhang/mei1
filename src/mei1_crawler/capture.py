@@ -13,7 +13,11 @@ from playwright.sync_api import Page, Response
 from .db import Database
 from .parser import (
     LIST_ENDPOINT,
+    account_scope_for_endpoint,
+    detail_category_for_endpoint,
     endpoint_path,
+    extract_data,
+    extract_attachments,
     extract_account_items,
     extract_member_profile,
     extract_rows,
@@ -21,8 +25,13 @@ from .parser import (
     is_member_endpoint,
     normalize_account_item,
     normalize_asset_snapshot,
+    normalize_attachment,
+    normalize_detail_record,
     normalize_list_observation,
     normalize_member,
+    normalize_partner_info,
+    normalize_service_record,
+    normalize_survey_profile,
     page_area_for_endpoint,
 )
 
@@ -36,6 +45,11 @@ class CaptureStats:
     detail_profiles: int = 0
     asset_snapshots: int = 0
     account_items: int = 0
+    service_records: int = 0
+    detail_records: int = 0
+    survey_profiles: int = 0
+    attachments: int = 0
+    partner_infos: int = 0
     new_members: int = 0
     changed_members: int = 0
     unchanged_members: int = 0
@@ -136,10 +150,22 @@ class ApiCapture:
 
         if path == LIST_ENDPOINT:
             self._save_member_list(response_json, request_body, source_payload_id)
-        elif path.startswith(("/api/member/detailInfo/", "/api/member/detail/")):
+        elif path.startswith(("/api/member/detailInfo/", "/api/member/detail/", "/api/member/memberAttr/")) or re.fullmatch(
+            r"/api/member/[^/?#]+", path
+        ):
             self._save_member_profile(path, response_json)
-        elif path.startswith("/api/member/amount/"):
+        elif path.startswith(("/api/member/amount/", "/api/member/queryMemberRemainConsumeValue/")):
             self._save_asset_snapshot(path, response_json)
+        elif account_scope_for_endpoint(path, request_body):
+            self._save_account_items(path, request_body, response_json)
+        elif path == "/api/wechatbusinessassists/memberServiceList":
+            self._save_service_records(path, request_body, response_json)
+        elif detail_category_for_endpoint(path, request_body):
+            self._save_detail_records(path, request_body, response_json)
+        elif path.startswith("/api/memberSurveys/profile/") or path == "/api/tduckDataProxy/query":
+            self._save_survey_profiles(path, request_body, response_json)
+        elif path.startswith(("/api/storePartner/getStorePartnerByMemberId/", "/api/storePartnerAccount/queryByMemberId/")):
+            self._save_partner_info(path, request_body, response_json)
 
     def _record_permission_skip(self, path: str, status_code: int | None) -> None:
         with self._lock:
@@ -211,11 +237,11 @@ class ApiCapture:
         member = normalize_member(profile, self.tenant_key)
         member_id = self.db.upsert_member(member)
         self.db.mark_member_detail_seen(member_id)
-        for account_row in extract_account_items(payload):
-            account_item = normalize_account_item(account_row, member_id)
-            self.db.save_account_item(account_item)
+        for attachment_row in extract_attachments(payload):
+            attachment = normalize_attachment(attachment_row, member_id)
+            self.db.save_attachment(attachment)
             with self._lock:
-                self.stats.account_items += 1
+                self.stats.attachments += 1
         if source_id:
             self._seen_member_source_ids[str(source_id)] = member_id
         with self._lock:
@@ -236,6 +262,86 @@ class ApiCapture:
         self.db.save_asset_snapshot(self.run_id, snapshot)
         with self._lock:
             self.stats.asset_snapshots += 1
+
+    def _save_account_items(self, path: str, request_body: Any, payload: Any) -> None:
+        source_id = self._member_source_id_for_payload(path, request_body, payload)
+        member_id = self._member_id_for_source(source_id)
+        if member_id is None:
+            return
+        item_scope = account_scope_for_endpoint(path, request_body)
+        if not item_scope:
+            return
+        rows = extract_account_items(payload) or extract_rows(payload)
+        for account_row in rows:
+            account_item = normalize_account_item(account_row, member_id, item_scope)
+            self.db.save_account_item(account_item)
+            with self._lock:
+                self.stats.account_items += 1
+
+    def _save_service_records(self, path: str, request_body: Any, payload: Any) -> None:
+        source_id = self._member_source_id_for_payload(path, request_body, payload)
+        member_id = self._member_id_for_source(source_id)
+        if member_id is None:
+            return
+        for row in extract_rows(payload):
+            record = normalize_service_record(row, member_id)
+            self.db.save_service_record(record)
+            with self._lock:
+                self.stats.service_records += 1
+
+    def _save_detail_records(self, path: str, request_body: Any, payload: Any) -> None:
+        source_id = self._member_source_id_for_payload(path, request_body, payload)
+        member_id = self._member_id_for_source(source_id)
+        category = detail_category_for_endpoint(path, request_body)
+        if member_id is None or not category:
+            return
+        for row in extract_rows(payload):
+            record = normalize_detail_record(row, member_id, category)
+            self.db.save_detail_record(record)
+            with self._lock:
+                self.stats.detail_records += 1
+
+    def _save_survey_profiles(self, path: str, request_body: Any, payload: Any) -> None:
+        source_id = self._member_source_id_for_payload(path, request_body, payload)
+        member_id = self._member_id_for_source(source_id)
+        if member_id is None:
+            return
+        rows = extract_rows(payload)
+        if not rows:
+            data = extract_data(payload)
+            rows = [data] if isinstance(data, dict) and data else []
+        for row in rows:
+            profile = normalize_survey_profile(row, member_id)
+            self.db.save_survey_profile(profile)
+            with self._lock:
+                self.stats.survey_profiles += 1
+
+    def _save_partner_info(self, path: str, request_body: Any, payload: Any) -> None:
+        source_id = self._member_source_id_for_payload(path, request_body, payload)
+        member_id = self._member_id_for_source(source_id)
+        if member_id is None:
+            return
+        info = normalize_partner_info(payload, member_id)
+        if info is None:
+            return
+        self.db.save_partner_info(info)
+        with self._lock:
+            self.stats.partner_infos += 1
+
+    def _member_id_for_source(self, source_id: str | None) -> int | None:
+        if not source_id:
+            return None
+        return self._seen_member_source_ids.get(str(source_id)) or self.db.find_member_id(
+            tenant_key=self.tenant_key,
+            source_member_id=str(source_id),
+        )
+
+    def _member_source_id_for_payload(self, path: str, request_body: Any, payload: Any) -> str | None:
+        return _member_id_from_path(path) or _first_str_from_any(request_body, "memberId", "holderId") or _first_str_from_any(
+            payload,
+            "memberId",
+            "id",
+        )
 
     def _response_json(self, response: Response) -> Any | None:
         content_type = response.headers.get("content-type", "")
@@ -258,7 +364,16 @@ class ApiCapture:
 
 
 def _member_id_from_path(path: str) -> str | None:
-    match = re.search(r"/api/member/(?:detailInfo|detail|amount)/([^/?#]+)", path)
+    match = re.search(
+        r"/api/(?:"
+        r"member/(?:detailInfo|detail|amount|memberAttr|queryMemberRemainConsumeValue)/"
+        r"|member/"
+        r"|memberSurveys/profile/"
+        r"|storePartner/getStorePartnerByMemberId/"
+        r"|storePartnerAccount/queryByMemberId/"
+        r")([^/?#]+)$",
+        path,
+    )
     return match.group(1) if match else None
 
 
@@ -301,6 +416,8 @@ def _first_str_from_any(value: Any, *keys: str) -> str | None:
 
 def _first_from_any(value: Any, *keys: str) -> Any:
     if isinstance(value, dict):
+        if value.get("field") in keys and value.get("value") not in (None, ""):
+            return value.get("value")
         for key in keys:
             if key in value and value[key] not in (None, ""):
                 return value[key]
