@@ -1,0 +1,18 @@
+[project]
+name = "mei1-crawler"
+version = "0.1.0"
+description = "Local SQLite + Playwright crawler for Mei1 customer list and detail data."
+requires-python = ">=3.12"
+dependencies = [
+  "playwright>=1.45",
+]
+
+[project.scripts]
+mei1-crawler = "mei1_crawler.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
