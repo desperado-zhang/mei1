@@ -284,6 +284,7 @@ def crawl_ego_batch(args: argparse.Namespace) -> int:
     )
     current_page = args.start_page
     window_index = 1
+    failed_detail_targets: list[str] = []
     while current_page <= args.end_page:
         pages = min(args.window_pages, args.end_page - current_page + 1)
         last_page = current_page + pages - 1
@@ -315,15 +316,13 @@ def crawl_ego_batch(args: argparse.Namespace) -> int:
             for detail_index, batch in enumerate(detail_batches, start=1):
                 print(f"[mei1-crawler] batch detail window {detail_index}/{len(detail_batches)}: members={len(batch)}")
                 detail_reasons = {source_id: "full" for source_id in batch}
-                code = run_ego_detail_window(
+                failures = run_ego_detail_batch_resilient(
                     args,
                     member_ids=batch,
                     detail_reasons=detail_reasons,
                     handoff_on_complete=handoff_on_complete and detail_index == len(detail_batches),
                 )
-                if code != 0:
-                    print(f"[mei1-crawler] batch stopped at pages {current_page}-{last_page}", file=sys.stderr)
-                    return code
+                failed_detail_targets.extend(failures)
         else:
             code = run_ego_window(
                 args,
@@ -336,6 +335,12 @@ def crawl_ego_batch(args: argparse.Namespace) -> int:
             return code
         current_page = last_page + 1
         window_index += 1
+    if failed_detail_targets:
+        print(
+            "[mei1-crawler] ego-lite batch completed with skipped detail targets: "
+            + ",".join(failed_detail_targets),
+            file=sys.stderr,
+        )
     print("[mei1-crawler] ego-lite batch completed")
     return 0
 
@@ -408,17 +413,65 @@ def crawl_ego_incremental(args: argparse.Namespace) -> int:
         detail_targets[index : index + args.detail_batch_size]
         for index in range(0, len(detail_targets), args.detail_batch_size)
     ]
+    failed_detail_targets: list[str] = []
     for index, batch in enumerate(detail_batches, start=1):
         print(f"[mei1-crawler] incremental detail window {index}: members={len(batch)}")
-        code = run_ego_detail_window(
+        failures = run_ego_detail_batch_resilient(
             args,
             member_ids=batch,
             detail_reasons=detail_reasons,
             handoff_on_complete=index == len(detail_batches),
         )
-        if code != 0:
-            return code
+        failed_detail_targets.extend(failures)
+    if failed_detail_targets:
+        print(
+            "[mei1-crawler] incremental completed with skipped detail targets: "
+            + ",".join(failed_detail_targets),
+            file=sys.stderr,
+        )
     return 0
+
+
+def run_ego_detail_batch_resilient(
+    args: argparse.Namespace,
+    *,
+    member_ids: list[str],
+    detail_reasons: dict[str, str],
+    handoff_on_complete: bool,
+) -> list[str]:
+    if not member_ids:
+        return []
+    code = run_ego_detail_window(
+        args,
+        member_ids=member_ids,
+        detail_reasons=detail_reasons,
+        handoff_on_complete=handoff_on_complete,
+    )
+    if code == 0:
+        return []
+    if len(member_ids) == 1:
+        print(f"[mei1-crawler] skipped detail target after ego-lite failure: {member_ids[0]}", file=sys.stderr)
+        return member_ids
+
+    midpoint = len(member_ids) // 2
+    failures: list[str] = []
+    failures.extend(
+        run_ego_detail_batch_resilient(
+            args,
+            member_ids=member_ids[:midpoint],
+            detail_reasons=detail_reasons,
+            handoff_on_complete=False,
+        )
+    )
+    failures.extend(
+        run_ego_detail_batch_resilient(
+            args,
+            member_ids=member_ids[midpoint:],
+            detail_reasons=detail_reasons,
+            handoff_on_complete=handoff_on_complete,
+        )
+    )
+    return failures
 
 
 def rebuild_sync_state(args: argparse.Namespace) -> int:

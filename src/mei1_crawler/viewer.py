@@ -18,6 +18,35 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 DEFAULT_PAGE_SIZE = 20
 PAGE_SIZE_OPTIONS = (20, 50, 100)
 MAX_EXPORT_ROWS = 100_000
+ACCOUNT_PAGE_SIZE = 100
+RECORD_PAGE_SIZE = 50
+
+DETAIL_TABS = (
+    ("account", "会员账户"),
+    ("profile", "会员资料"),
+    ("customer_data", "客户数据"),
+    ("service", "服务记录"),
+    ("detail_records", "顾客数据明细"),
+    ("survey", "美问问卷"),
+    ("partner", "合伙人信息"),
+    ("attachments", "客户附件"),
+)
+
+ACCOUNT_SCOPE_ORDER = ("held_card", "coupon", "present", "mall_coupon", "transferred", "deposit_item")
+DETAIL_CATEGORY_ORDER = (
+    "appointment",
+    "consume",
+    "gift",
+    "modification",
+    "wallet",
+    "points",
+    "mall_order",
+    "face_scan",
+    "reach_store",
+    "deposit",
+    "other",
+)
+SERVICE_TYPE_ORDER = ("return_visit", "service_note", "development_plan", "other")
 
 
 @dataclass(frozen=True)
@@ -91,7 +120,7 @@ def _make_handler(db_path: Path) -> type[BaseHTTPRequestHandler]:
 
         def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API.
             parsed = urlparse(self.path)
-            if parsed.path == "/export.csv":
+            if parsed.path in {"/export.csv", "/member-export.csv"}:
                 content_type = "text/csv; charset=utf-8"
             elif parsed.path == "/healthz":
                 content_type = "text/plain; charset=utf-8"
@@ -124,6 +153,11 @@ def _make_handler(db_path: Path) -> type[BaseHTTPRequestHandler]:
                 return
             if parsed.path == "/members":
                 self._send_html(_render_members_page(db_path, params))
+                return
+            if parsed.path == "/member-export.csv":
+                body, filename, status = _render_member_tab_export_csv(db_path, params)
+                headers = {"Content-Disposition": f'attachment; filename="{filename}"'} if status == HTTPStatus.OK else None
+                self._send_bytes(body, "text/csv; charset=utf-8", status=status, headers=headers)
                 return
             if parsed.path.startswith("/members/"):
                 member_id = _parse_member_id(parsed.path)
@@ -219,6 +253,14 @@ def _render_member_detail_page(
     member_id: int,
     params: dict[str, list[str]],
 ) -> tuple[str, HTTPStatus]:
+    active_tab = _detail_tab_from_params(params)
+    account_scope = _scoped_param(params, "account_scope", ACCOUNT_SCOPE_ORDER)
+    detail_category = _scoped_param(params, "detail_category", DETAIL_CATEGORY_ORDER)
+    service_type = _scoped_param(params, "service_type", SERVICE_TYPE_ORDER)
+    account_page = max(1, _int_param(params, "account_page", 1))
+    detail_page = max(1, _int_param(params, "detail_page", 1))
+    service_page = max(1, _int_param(params, "service_page", 1))
+
     with _connect_readonly(db_path) as conn:
         stats = _load_stats(conn, db_path)
         member = conn.execute(
@@ -228,6 +270,9 @@ def _render_member_detail_page(
               (SELECT COUNT(*) FROM member_account_items i WHERE i.member_id = m.id) AS account_count,
               (SELECT COUNT(*) FROM member_service_records r WHERE r.member_id = m.id) AS service_count,
               (SELECT COUNT(*) FROM member_detail_records r WHERE r.member_id = m.id) AS detail_count,
+              (SELECT COUNT(*) FROM member_survey_profiles s WHERE s.member_id = m.id) AS survey_count,
+              (SELECT COUNT(*) FROM member_attachments a WHERE a.member_id = m.id) AS attachment_count,
+              (SELECT COUNT(*) FROM member_partner_infos p WHERE p.member_id = m.id) AS partner_count,
               (SELECT COUNT(*) FROM member_tags t WHERE t.member_id = m.id) AS tag_count
             FROM members m
             WHERE m.id = ?
@@ -237,15 +282,27 @@ def _render_member_detail_page(
         if member is None:
             return _layout("客户详情", _render_empty("未找到这个客户"), stats), HTTPStatus.NOT_FOUND
 
-        account_items = conn.execute(
+        account_counts = _group_counts(
+            conn,
+            "SELECT item_scope AS key, COUNT(*) AS count FROM member_account_items WHERE member_id = ? GROUP BY item_scope",
+            (member_id,),
+        )
+        detail_counts = _group_counts(
+            conn,
+            "SELECT category AS key, COUNT(*) AS count FROM member_detail_records WHERE member_id = ? GROUP BY category",
+            (member_id,),
+        )
+        service_counts = _group_counts(
+            conn,
+            "SELECT record_type AS key, COUNT(*) AS count FROM member_service_records WHERE member_id = ? GROUP BY record_type",
+            (member_id,),
+        )
+        tags = conn.execute(
             """
-            SELECT item_scope, item_no, item_name, item_type, status, source_name,
-                   valid_from, valid_to, remaining_times_text, balance_cents,
-                   display_balance_text, last_seen_at
-            FROM member_account_items
+            SELECT tag_type, tag_name, color, last_seen_at
+            FROM member_tags
             WHERE member_id = ?
-            ORDER BY last_seen_at DESC, id DESC
-            LIMIT 50
+            ORDER BY tag_type, tag_name
             """,
             (member_id,),
         ).fetchall()
@@ -257,43 +314,139 @@ def _render_member_detail_page(
             FROM member_asset_snapshots
             WHERE member_id = ?
             ORDER BY observed_at DESC, id DESC
-            LIMIT 5
+            LIMIT 10
             """,
             (member_id,),
         ).fetchall()
+
+        account_where = "member_id = ?"
+        account_args: list[Any] = [member_id]
+        if account_scope:
+            account_where += " AND item_scope = ?"
+            account_args.append(account_scope)
+        account_total = _count_rows(conn, f"SELECT COUNT(*) FROM member_account_items WHERE {account_where}", account_args)
+        account_page = _bounded_page(account_page, account_total, ACCOUNT_PAGE_SIZE)
+        account_items = conn.execute(
+            """
+            SELECT item_scope, item_no, item_name, item_type, status, source_name,
+                   valid_from, valid_to, remaining_times_text, balance_cents,
+                   display_balance_text, last_seen_at
+            FROM member_account_items
+            WHERE """ + account_where + """
+            ORDER BY item_scope, COALESCE(valid_to, last_seen_at) DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*account_args, ACCOUNT_PAGE_SIZE, (account_page - 1) * ACCOUNT_PAGE_SIZE],
+        ).fetchall()
+
+        service_where = "member_id = ?"
+        service_args: list[Any] = [member_id]
+        if service_type:
+            service_where += " AND record_type = ?"
+            service_args.append(service_type)
+        service_total = _count_rows(conn, f"SELECT COUNT(*) FROM member_service_records WHERE {service_where}", service_args)
+        service_page = _bounded_page(service_page, service_total, RECORD_PAGE_SIZE)
         service_records = conn.execute(
             """
             SELECT record_type, record_at, employee_name, content, related_items_text, last_seen_at
             FROM member_service_records
-            WHERE member_id = ?
+            WHERE """ + service_where + """
             ORDER BY COALESCE(record_at, last_seen_at) DESC, id DESC
-            LIMIT 20
+            LIMIT ? OFFSET ?
             """,
-            (member_id,),
+            [*service_args, RECORD_PAGE_SIZE, (service_page - 1) * RECORD_PAGE_SIZE],
         ).fetchall()
+
+        detail_where = "member_id = ?"
+        detail_args: list[Any] = [member_id]
+        if detail_category:
+            detail_where += " AND category = ?"
+            detail_args.append(detail_category)
+        detail_total = _count_rows(conn, f"SELECT COUNT(*) FROM member_detail_records WHERE {detail_where}", detail_args)
+        detail_page = _bounded_page(detail_page, detail_total, RECORD_PAGE_SIZE)
         detail_records = conn.execute(
             """
             SELECT category, happened_at, title, status, amount_cents, store_name,
-                   employee_name, content, order_no, last_seen_at
+                   employee_name, room_name, content, order_no, duration_minutes, last_seen_at
             FROM member_detail_records
-            WHERE member_id = ?
+            WHERE """ + detail_where + """
             ORDER BY COALESCE(happened_at, last_seen_at) DESC, id DESC
-            LIMIT 30
+            LIMIT ? OFFSET ?
+            """,
+            [*detail_args, RECORD_PAGE_SIZE, (detail_page - 1) * RECORD_PAGE_SIZE],
+        ).fetchall()
+        survey_profiles = conn.execute(
+            """
+            SELECT source_profile_id, profile_name, profile_url, field_values_json, last_seen_at
+            FROM member_survey_profiles
+            WHERE member_id = ?
+            ORDER BY last_seen_at DESC, id DESC
+            LIMIT 50
             """,
             (member_id,),
         ).fetchall()
-        tags = conn.execute(
+        attachments = conn.execute(
             """
-            SELECT tag_type, tag_name, color, last_seen_at
-            FROM member_tags
+            SELECT source_file_id, file_name, content_type, file_url_hash, note, uploaded_at, last_seen_at
+            FROM member_attachments
             WHERE member_id = ?
-            ORDER BY tag_type, tag_name
+            ORDER BY COALESCE(uploaded_at, last_seen_at) DESC, id DESC
+            LIMIT 50
+            """,
+            (member_id,),
+        ).fetchall()
+        partner_infos = conn.execute(
+            """
+            SELECT partner_member_id, partner_level, store_balance_cents, withdrawable_cents,
+                   direct_referrer_name, indirect_referrer_name, last_seen_at
+            FROM member_partner_infos
+            WHERE member_id = ?
+            ORDER BY last_seen_at DESC, id DESC
+            LIMIT 20
             """,
             (member_id,),
         ).fetchall()
 
     return_to = _safe_return_url(_first_param(params, "return")) or "/members"
     raw_summary = _raw_json_summary(member["raw_profile_json"])
+    tab_counts = {
+        "account": member["account_count"],
+        "profile": member["tag_count"],
+        "customer_data": len(asset_snapshots),
+        "service": member["service_count"],
+        "detail_records": member["detail_count"],
+        "survey": member["survey_count"],
+        "partner": member["partner_count"],
+        "attachments": member["attachment_count"],
+    }
+    tab_content = _render_active_member_tab(
+        member_id=member_id,
+        member=member,
+        return_to=return_to,
+        active_tab=active_tab,
+        tab_params=params,
+        account_scope=account_scope,
+        account_counts=account_counts,
+        account_items=account_items,
+        account_total=account_total,
+        account_page=account_page,
+        asset_snapshots=asset_snapshots,
+        service_type=service_type,
+        service_counts=service_counts,
+        service_records=service_records,
+        service_total=service_total,
+        service_page=service_page,
+        detail_category=detail_category,
+        detail_counts=detail_counts,
+        detail_records=detail_records,
+        detail_total=detail_total,
+        detail_page=detail_page,
+        survey_profiles=survey_profiles,
+        attachments=attachments,
+        partner_infos=partner_infos,
+        tags=tags,
+        raw_summary=raw_summary,
+    )
     content = f"""
     <section class="detail-head">
       <a class="button" href="{_h(return_to)}">返回列表</a>
@@ -323,7 +476,7 @@ def _render_member_detail_page(
           <div><strong>{member["account_count"]}</strong><span>账户项目</span></div>
           <div><strong>{member["service_count"]}</strong><span>服务记录</span></div>
           <div><strong>{member["detail_count"]}</strong><span>明细记录</span></div>
-          <div><strong>{member["tag_count"]}</strong><span>标签</span></div>
+          <div><strong>{member["partner_count"]}</strong><span>合伙信息</span></div>
         </div>
       </article>
       <article class="panel">
@@ -336,29 +489,263 @@ def _render_member_detail_page(
         ))}
       </article>
     </section>
-    <section class="panel">
-      <h2>账户项目</h2>
-      {_render_account_items(account_items)}
-    </section>
-    <section class="panel">
-      <h2>资产快照</h2>
-      {_render_asset_snapshots(asset_snapshots)}
-    </section>
-    <section class="panel">
-      <h2>服务记录</h2>
-      {_render_service_records(service_records)}
-    </section>
-    <section class="panel">
-      <h2>客户数据明细</h2>
-      {_render_detail_records(detail_records)}
-    </section>
-    <section class="panel">
-      <h2>标签与原始资料摘要</h2>
-      {_render_tags(tags)}
-      <div class="raw-summary">{_h(raw_summary)}</div>
-    </section>
+    {_render_detail_tab_nav(member_id, return_to, active_tab, tab_counts)}
+    {tab_content}
     """
     return _layout("客户详情", content, stats), HTTPStatus.OK
+
+
+def _render_active_member_tab(
+    *,
+    member_id: int,
+    member: sqlite3.Row,
+    return_to: str,
+    active_tab: str,
+    tab_params: dict[str, list[str]],
+    account_scope: str,
+    account_counts: dict[str, int],
+    account_items: list[sqlite3.Row],
+    account_total: int,
+    account_page: int,
+    asset_snapshots: list[sqlite3.Row],
+    service_type: str,
+    service_counts: dict[str, int],
+    service_records: list[sqlite3.Row],
+    service_total: int,
+    service_page: int,
+    detail_category: str,
+    detail_counts: dict[str, int],
+    detail_records: list[sqlite3.Row],
+    detail_total: int,
+    detail_page: int,
+    survey_profiles: list[sqlite3.Row],
+    attachments: list[sqlite3.Row],
+    partner_infos: list[sqlite3.Row],
+    tags: list[sqlite3.Row],
+    raw_summary: str,
+) -> str:
+    export_href = _member_export_href(member_id, active_tab, tab_params)
+    export_button = f'<a class="button export" href="{_h(export_href)}">导出当前 Tab CSV</a>'
+
+    if active_tab == "profile":
+        return f"""
+        <section class="panel">
+          <div class="section-head"><h2>会员资料</h2>{export_button}</div>
+          {_render_key_values(_member_basic_pairs(member))}
+          <h3>标签</h3>
+          {_render_tags(tags)}
+          <h3>原始资料摘要</h3>
+          <div class="raw-summary">{_h(raw_summary)}</div>
+        </section>
+        """
+
+    if active_tab == "customer_data":
+        return f"""
+        <section class="panel">
+          <div class="section-head"><h2>客户数据</h2>{export_button}</div>
+          <div class="metric-grid compact">
+            <div><strong>{member["account_count"]}</strong><span>账户项目</span></div>
+            <div><strong>{member["service_count"]}</strong><span>服务记录</span></div>
+            <div><strong>{member["detail_count"]}</strong><span>明细记录</span></div>
+            <div><strong>{_h(_date_time(member["detail_last_seen_at"]))}</strong><span>详情采集</span></div>
+          </div>
+          <h3>资产快照</h3>
+          {_render_asset_snapshots(asset_snapshots)}
+        </section>
+        """
+
+    if active_tab == "service":
+        return f"""
+        <section class="panel">
+          <div class="section-head"><h2>服务记录</h2>{export_button}</div>
+          {_render_scope_filter(
+              member_id,
+              return_to,
+              "service",
+              "service_type",
+              service_type,
+              service_counts,
+              SERVICE_TYPE_ORDER,
+              _record_type_label,
+              "全部服务",
+              "service_page",
+          )}
+          {_render_service_records(service_records)}
+          {_render_table_pagination(
+              total=service_total,
+              page=service_page,
+              page_size=RECORD_PAGE_SIZE,
+              make_href=lambda page: _member_detail_href(
+                  member_id,
+                  return_to,
+                  "service",
+                  service_type=service_type,
+                  service_page=page,
+              ),
+          )}
+        </section>
+        """
+
+    if active_tab == "detail_records":
+        return f"""
+        <section class="panel">
+          <div class="section-head"><h2>顾客数据明细</h2>{export_button}</div>
+          {_render_scope_filter(
+              member_id,
+              return_to,
+              "detail_records",
+              "detail_category",
+              detail_category,
+              detail_counts,
+              DETAIL_CATEGORY_ORDER,
+              _detail_category_label,
+              "全部明细",
+              "detail_page",
+          )}
+          {_render_detail_records(detail_records)}
+          {_render_table_pagination(
+              total=detail_total,
+              page=detail_page,
+              page_size=RECORD_PAGE_SIZE,
+              make_href=lambda page: _member_detail_href(
+                  member_id,
+                  return_to,
+                  "detail_records",
+                  detail_category=detail_category,
+                  detail_page=page,
+              ),
+          )}
+        </section>
+        """
+
+    if active_tab == "survey":
+        return f"""
+        <section class="panel">
+          <div class="section-head"><h2>美问问卷</h2>{export_button}</div>
+          {_render_survey_profiles(survey_profiles)}
+        </section>
+        """
+
+    if active_tab == "partner":
+        return f"""
+        <section class="panel">
+          <div class="section-head"><h2>合伙人信息</h2>{export_button}</div>
+          {_render_partner_infos(partner_infos)}
+        </section>
+        """
+
+    if active_tab == "attachments":
+        return f"""
+        <section class="panel">
+          <div class="section-head"><h2>客户附件</h2>{export_button}</div>
+          {_render_attachments(attachments)}
+        </section>
+        """
+
+    return f"""
+    <section class="panel">
+      <div class="section-head"><h2>会员账户</h2>{export_button}</div>
+      {_render_scope_filter(
+          member_id,
+          return_to,
+          "account",
+          "account_scope",
+          account_scope,
+          account_counts,
+          ACCOUNT_SCOPE_ORDER,
+          _item_scope_label,
+          "全部账户",
+          "account_page",
+      )}
+      {_render_account_items(account_items)}
+      {_render_table_pagination(
+          total=account_total,
+          page=account_page,
+          page_size=ACCOUNT_PAGE_SIZE,
+          make_href=lambda page: _member_detail_href(
+              member_id,
+              return_to,
+              "account",
+              account_scope=account_scope,
+              account_page=page,
+          ),
+      )}
+    </section>
+    """
+
+
+def _render_detail_tab_nav(
+    member_id: int,
+    return_to: str,
+    active_tab: str,
+    tab_counts: dict[str, Any],
+) -> str:
+    links = []
+    for tab, label in DETAIL_TABS:
+        href = _member_detail_href(member_id, return_to, tab)
+        count = tab_counts.get(tab)
+        count_html = "" if count in (None, "") else f'<span class="pill-count">{int(count or 0)}</span>'
+        classes = "tab-link active" if tab == active_tab else "tab-link"
+        links.append(f'<a class="{classes}" href="{_h(href)}">{_h(label)}{count_html}</a>')
+    return f'<nav class="tab-nav" aria-label="客户详情 Tab">{"".join(links)}</nav>'
+
+
+def _render_scope_filter(
+    member_id: int,
+    return_to: str,
+    tab: str,
+    param_name: str,
+    selected: str,
+    counts: dict[str, int],
+    order: tuple[str, ...],
+    label_func: Any,
+    all_label: str,
+    page_param: str,
+) -> str:
+    items = [("", all_label, sum(counts.values()))]
+    for key in _ordered_count_keys(counts, order):
+        items.append((key, label_func(key), counts.get(key, 0)))
+
+    chips = []
+    for key, label, count in items:
+        extra = {param_name: key, page_param: 1}
+        href = _member_detail_href(member_id, return_to, tab, **extra)
+        active = " active" if key == selected else ""
+        chips.append(
+            f'<a class="scope-chip{active}" href="{_h(href)}">{_h(label)}<span class="pill-count">{count}</span></a>'
+        )
+    return f'<div class="scope-tabs">{"".join(chips)}</div>'
+
+
+def _render_table_pagination(
+    *,
+    total: int,
+    page: int,
+    page_size: int,
+    make_href: Any,
+) -> str:
+    if total <= page_size:
+        return f'<div class="table-meta">显示 {min(total, page_size)} / {total}</div>'
+    page_count = max(1, math.ceil(total / page_size))
+    current_page = min(max(1, page), page_count)
+    start = (current_page - 1) * page_size + 1
+    end = min(total, current_page * page_size)
+    prev_html = (
+        f'<a class="page-link" href="{_h(make_href(current_page - 1))}">上一页</a>'
+        if current_page > 1
+        else '<span class="page-link disabled">上一页</span>'
+    )
+    next_html = (
+        f'<a class="page-link" href="{_h(make_href(current_page + 1))}">下一页</a>'
+        if current_page < page_count
+        else '<span class="page-link disabled">下一页</span>'
+    )
+    return f"""
+    <div class="table-pager">
+      <span>显示 {start}-{end} / {total}</span>
+      <nav>{prev_html}<span class="page-link current">{current_page}/{page_count}</span>{next_html}</nav>
+    </div>
+    """
 
 
 def _render_export_csv(db_path: Path, params: dict[str, list[str]]) -> tuple[bytes, str]:
@@ -383,6 +770,246 @@ def _render_export_csv(db_path: Path, params: dict[str, list[str]]) -> tuple[byt
 
     filename = f"mei1_customers_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     return output.getvalue().encode("utf-8"), filename
+
+
+def _render_member_tab_export_csv(
+    db_path: Path,
+    params: dict[str, list[str]],
+) -> tuple[bytes, str, HTTPStatus]:
+    member_id = _int_param(params, "member_id", 0)
+    if member_id <= 0:
+        return _csv_error("member_id 无效"), "mei1_member_export_error.csv", HTTPStatus.BAD_REQUEST
+
+    tab = _detail_tab_from_params(params)
+    account_scope = _scoped_param(params, "account_scope", ACCOUNT_SCOPE_ORDER)
+    detail_category = _scoped_param(params, "detail_category", DETAIL_CATEGORY_ORDER)
+    service_type = _scoped_param(params, "service_type", SERVICE_TYPE_ORDER)
+
+    with _connect_readonly(db_path) as conn:
+        member = conn.execute("SELECT * FROM members WHERE id = ?", (member_id,)).fetchone()
+        if member is None:
+            return _csv_error("未找到客户"), "mei1_member_export_error.csv", HTTPStatus.NOT_FOUND
+
+        output = io.StringIO(newline="")
+        output.write("\ufeff")
+        writer = csv.writer(output)
+
+        if tab == "profile":
+            writer.writerow(["字段", "值"])
+            for label, value in _member_basic_pairs(member):
+                writer.writerow([label, _display(value)])
+            tag_rows = conn.execute(
+                "SELECT tag_name FROM member_tags WHERE member_id = ? ORDER BY tag_type, tag_name",
+                (member_id,),
+            ).fetchall()
+            writer.writerow(["标签", "；".join(str(row["tag_name"]) for row in tag_rows) if tag_rows else ""])
+            writer.writerow(["原始资料摘要", _raw_json_summary(member["raw_profile_json"])])
+        elif tab == "customer_data":
+            writer.writerow(["时间", "钱包", "剩余消费", "积分", "欠款", "卡数", "到店", "生命周期"])
+            rows = conn.execute(
+                """
+                SELECT member_wallet_cents, remaining_consume_value_cents, points, debt_cents,
+                       card_count, total_visit_count, lifecycle_category, observed_at
+                FROM member_asset_snapshots
+                WHERE member_id = ?
+                ORDER BY observed_at DESC, id DESC
+                LIMIT ?
+                """,
+                (member_id, MAX_EXPORT_ROWS),
+            ).fetchall()
+            for row in rows:
+                writer.writerow(
+                    [
+                        _date_time(row["observed_at"]),
+                        _money(row["member_wallet_cents"]),
+                        _money(row["remaining_consume_value_cents"]),
+                        _display(row["points"]),
+                        _money(row["debt_cents"]),
+                        _display(row["card_count"]),
+                        _display(row["total_visit_count"]),
+                        _display(row["lifecycle_category"]),
+                    ]
+                )
+        elif tab == "service":
+            service_where = "member_id = ?"
+            service_args: list[Any] = [member_id]
+            if service_type:
+                service_where += " AND record_type = ?"
+                service_args.append(service_type)
+            writer.writerow(["类型", "时间", "员工", "内容", "关联项目", "最后采集"])
+            rows = conn.execute(
+                """
+                SELECT record_type, record_at, employee_name, content, related_items_text, last_seen_at
+                FROM member_service_records
+                WHERE """ + service_where + """
+                ORDER BY COALESCE(record_at, last_seen_at) DESC, id DESC
+                LIMIT ?
+                """,
+                [*service_args, MAX_EXPORT_ROWS],
+            ).fetchall()
+            for row in rows:
+                writer.writerow(
+                    [
+                        _record_type_label(row["record_type"]),
+                        _date_time(row["record_at"]),
+                        _display(row["employee_name"]),
+                        _display(row["content"]),
+                        _display(row["related_items_text"]),
+                        _date_time(row["last_seen_at"]),
+                    ]
+                )
+        elif tab == "detail_records":
+            detail_where = "member_id = ?"
+            detail_args: list[Any] = [member_id]
+            if detail_category:
+                detail_where += " AND category = ?"
+                detail_args.append(detail_category)
+            writer.writerow(["分类", "时间", "标题", "单号", "门店", "房间", "员工", "金额", "时长分钟", "状态", "内容"])
+            rows = conn.execute(
+                """
+                SELECT category, happened_at, title, order_no, store_name, room_name,
+                       employee_name, amount_cents, duration_minutes, status, content
+                FROM member_detail_records
+                WHERE """ + detail_where + """
+                ORDER BY COALESCE(happened_at, last_seen_at) DESC, id DESC
+                LIMIT ?
+                """,
+                [*detail_args, MAX_EXPORT_ROWS],
+            ).fetchall()
+            for row in rows:
+                writer.writerow(
+                    [
+                        _detail_category_label(row["category"]),
+                        _date_time(row["happened_at"]),
+                        _display(row["title"]),
+                        _display(row["order_no"]),
+                        _display(row["store_name"]),
+                        _display(row["room_name"]),
+                        _display(row["employee_name"]),
+                        _money(row["amount_cents"]),
+                        _display(row["duration_minutes"]),
+                        _display(row["status"]),
+                        _display(row["content"]),
+                    ]
+                )
+        elif tab == "survey":
+            writer.writerow(["问卷ID", "问卷名称", "问卷地址", "字段摘要", "最后采集"])
+            rows = conn.execute(
+                """
+                SELECT source_profile_id, profile_name, profile_url, field_values_json, last_seen_at
+                FROM member_survey_profiles
+                WHERE member_id = ?
+                ORDER BY last_seen_at DESC, id DESC
+                LIMIT ?
+                """,
+                (member_id, MAX_EXPORT_ROWS),
+            ).fetchall()
+            for row in rows:
+                writer.writerow(
+                    [
+                        _display(row["source_profile_id"]),
+                        _display(row["profile_name"]),
+                        _display(row["profile_url"]),
+                        _json_value_summary(row["field_values_json"]),
+                        _date_time(row["last_seen_at"]),
+                    ]
+                )
+        elif tab == "partner":
+            writer.writerow(["合伙人ID", "等级", "店铺余额", "可提现", "直接推荐人", "间接推荐人", "最后采集"])
+            rows = conn.execute(
+                """
+                SELECT partner_member_id, partner_level, store_balance_cents, withdrawable_cents,
+                       direct_referrer_name, indirect_referrer_name, last_seen_at
+                FROM member_partner_infos
+                WHERE member_id = ?
+                ORDER BY last_seen_at DESC, id DESC
+                LIMIT ?
+                """,
+                (member_id, MAX_EXPORT_ROWS),
+            ).fetchall()
+            for row in rows:
+                writer.writerow(
+                    [
+                        _display(row["partner_member_id"]),
+                        _display(row["partner_level"]),
+                        _money(row["store_balance_cents"]),
+                        _money(row["withdrawable_cents"]),
+                        _display(row["direct_referrer_name"]),
+                        _display(row["indirect_referrer_name"]),
+                        _date_time(row["last_seen_at"]),
+                    ]
+                )
+        elif tab == "attachments":
+            writer.writerow(["附件ID", "文件名", "类型", "URL哈希", "备注", "上传时间", "最后采集"])
+            rows = conn.execute(
+                """
+                SELECT source_file_id, file_name, content_type, file_url_hash, note, uploaded_at, last_seen_at
+                FROM member_attachments
+                WHERE member_id = ?
+                ORDER BY COALESCE(uploaded_at, last_seen_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (member_id, MAX_EXPORT_ROWS),
+            ).fetchall()
+            for row in rows:
+                writer.writerow(
+                    [
+                        _display(row["source_file_id"]),
+                        _display(row["file_name"]),
+                        _display(row["content_type"]),
+                        _display(row["file_url_hash"]),
+                        _display(row["note"]),
+                        _date_time(row["uploaded_at"]),
+                        _date_time(row["last_seen_at"]),
+                    ]
+                )
+        else:
+            account_where = "member_id = ?"
+            account_args: list[Any] = [member_id]
+            if account_scope:
+                account_where += " AND item_scope = ?"
+                account_args.append(account_scope)
+            writer.writerow(["范围", "编号", "名称", "类型", "状态", "来源", "余额", "次数", "有效期起", "有效期至", "最后采集"])
+            rows = conn.execute(
+                """
+                SELECT item_scope, item_no, item_name, item_type, status, source_name,
+                       balance_cents, display_balance_text, remaining_times_text,
+                       valid_from, valid_to, last_seen_at
+                FROM member_account_items
+                WHERE """ + account_where + """
+                ORDER BY item_scope, COALESCE(valid_to, last_seen_at) DESC, id DESC
+                LIMIT ?
+                """,
+                [*account_args, MAX_EXPORT_ROWS],
+            ).fetchall()
+            for row in rows:
+                writer.writerow(
+                    [
+                        _item_scope_label(row["item_scope"]),
+                        _display(row["item_no"]),
+                        _display(row["item_name"]),
+                        _display(row["item_type"]),
+                        _display(row["status"]),
+                        _display(row["source_name"]),
+                        _display(row["display_balance_text"]) if row["display_balance_text"] else _money(row["balance_cents"]),
+                        _display(row["remaining_times_text"]),
+                        _date_only(row["valid_from"]),
+                        _date_only(row["valid_to"]),
+                        _date_time(row["last_seen_at"]),
+                    ]
+                )
+
+    filename = f"mei1_member_{member_id}_{tab}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    return output.getvalue().encode("utf-8"), filename, HTTPStatus.OK
+
+
+def _csv_error(message: str) -> bytes:
+    output = io.StringIO(newline="")
+    output.write("\ufeff")
+    writer = csv.writer(output)
+    writer.writerow(["错误"])
+    writer.writerow([message])
+    return output.getvalue().encode("utf-8")
 
 
 def _connect_readonly(db_path: Path) -> sqlite3.Connection:
@@ -765,23 +1392,115 @@ def _render_detail_records(rows: list[sqlite3.Row]) -> str:
         return _render_empty("暂无客户数据明细")
     body = []
     for row in rows:
+        details = " / ".join(
+            part
+            for part in (
+                row["store_name"],
+                row["room_name"],
+                row["employee_name"],
+            )
+            if part
+        )
         body.append(
             f"""
             <tr>
               <td>{_h(_detail_category_label(row["category"]))}</td>
               <td>{_h(_date_time(row["happened_at"]))}</td>
               <td>{_h(row["title"] or row["order_no"] or "-")}</td>
-              <td>{_h(row["store_name"] or "-")}</td>
-              <td>{_h(row["employee_name"] or "-")}</td>
+              <td>{_h(details or "-")}</td>
               <td>{_h(_money(row["amount_cents"]))}</td>
+              <td>{_h(row["duration_minutes"] if row["duration_minutes"] is not None else "-")}</td>
               <td>{_h(row["status"] or "-")}</td>
+              <td class="text-cell">{_h(row["content"] or "-")}</td>
             </tr>
             """
         )
     return f"""
     <div class="table-wrap small">
       <table>
-        <thead><tr><th>分类</th><th>时间</th><th>标题/单号</th><th>门店</th><th>员工</th><th>金额</th><th>状态</th></tr></thead>
+        <thead><tr><th>分类</th><th>时间</th><th>标题/单号</th><th>门店/房间/员工</th><th>金额</th><th>时长</th><th>状态</th><th>内容</th></tr></thead>
+        <tbody>{"".join(body)}</tbody>
+      </table>
+    </div>
+    """
+
+
+def _render_survey_profiles(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return _render_empty("暂无美问问卷")
+    body = []
+    for row in rows:
+        body.append(
+            f"""
+            <tr>
+              <td class="mono">{_h(row["source_profile_id"] or "-")}</td>
+              <td>{_h(row["profile_name"] or "-")}</td>
+              <td class="text-cell">{_h(row["profile_url"] or "-")}</td>
+              <td class="text-cell">{_h(_json_value_summary(row["field_values_json"]))}</td>
+              <td>{_h(_date_time(row["last_seen_at"]))}</td>
+            </tr>
+            """
+        )
+    return f"""
+    <div class="table-wrap small">
+      <table>
+        <thead><tr><th>问卷ID</th><th>名称</th><th>地址</th><th>字段摘要</th><th>最后采集</th></tr></thead>
+        <tbody>{"".join(body)}</tbody>
+      </table>
+    </div>
+    """
+
+
+def _render_partner_infos(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return _render_empty("暂无合伙人信息")
+    body = []
+    for row in rows:
+        body.append(
+            f"""
+            <tr>
+              <td class="mono">{_h(row["partner_member_id"] or "-")}</td>
+              <td>{_h(row["partner_level"] or "-")}</td>
+              <td>{_h(_money(row["store_balance_cents"]))}</td>
+              <td>{_h(_money(row["withdrawable_cents"]))}</td>
+              <td>{_h(row["direct_referrer_name"] or "-")}</td>
+              <td>{_h(row["indirect_referrer_name"] or "-")}</td>
+              <td>{_h(_date_time(row["last_seen_at"]))}</td>
+            </tr>
+            """
+        )
+    return f"""
+    <div class="table-wrap small">
+      <table>
+        <thead><tr><th>合伙人ID</th><th>等级</th><th>店铺余额</th><th>可提现</th><th>直接推荐人</th><th>间接推荐人</th><th>最后采集</th></tr></thead>
+        <tbody>{"".join(body)}</tbody>
+      </table>
+    </div>
+    """
+
+
+def _render_attachments(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return _render_empty("暂无客户附件")
+    body = []
+    for row in rows:
+        body.append(
+            f"""
+            <tr>
+              <td class="mono">{_h(row["source_file_id"] or "-")}</td>
+              <td>{_h(row["file_name"] or "-")}</td>
+              <td>{_h(row["content_type"] or "-")}</td>
+              <td class="mono">{_h(row["file_url_hash"] or "-")}</td>
+              <td class="text-cell">{_h(row["note"] or "-")}</td>
+              <td>{_h(_date_time(row["uploaded_at"]))}</td>
+              <td>{_h(_date_time(row["last_seen_at"]))}</td>
+            </tr>
+            """
+        )
+    return f"""
+    <div class="table-wrap small">
+      <table>
+        <thead><tr><th>附件ID</th><th>文件名</th><th>类型</th><th>URL哈希</th><th>备注</th><th>上传时间</th><th>最后采集</th></tr></thead>
         <tbody>{"".join(body)}</tbody>
       </table>
     </div>
@@ -858,6 +1577,34 @@ def _query_string(filters: CustomerFilters, overrides: dict[str, Any] | None = N
     return urlencode(compact)
 
 
+def _member_detail_href(member_id: int, return_to: str, tab: str, **overrides: Any) -> str:
+    values: dict[str, Any] = {"tab": tab}
+    if return_to:
+        values["return"] = return_to
+    values.update(overrides)
+    compact = {}
+    for key, value in values.items():
+        if value in ("", None):
+            continue
+        if key.endswith("_page"):
+            try:
+                if int(value) <= 1:
+                    continue
+            except (TypeError, ValueError):
+                continue
+        compact[key] = str(value)
+    return f"/members/{member_id}?{urlencode(compact)}"
+
+
+def _member_export_href(member_id: int, tab: str, params: dict[str, list[str]]) -> str:
+    values: dict[str, Any] = {"member_id": member_id, "tab": tab}
+    for key in ("account_scope", "service_type", "detail_category"):
+        value = _first_param(params, key)
+        if value:
+            values[key] = value
+    return f"/member-export.csv?{urlencode(values)}"
+
+
 def _parse_member_id(path: str) -> int | None:
     value = path.removeprefix("/members/").strip("/")
     if not value.isdigit():
@@ -871,6 +1618,37 @@ def _safe_return_url(value: str) -> str | None:
     if value.startswith("/members") and not value.startswith("//"):
         return value
     return None
+
+
+def _detail_tab_from_params(params: dict[str, list[str]]) -> str:
+    value = _first_param(params, "tab")
+    valid = {tab for tab, _label in DETAIL_TABS}
+    return value if value in valid else "account"
+
+
+def _scoped_param(params: dict[str, list[str]], name: str, allowed: tuple[str, ...]) -> str:
+    value = _first_param(params, name)
+    return value if value in allowed else ""
+
+
+def _count_rows(conn: sqlite3.Connection, sql: str, args: list[Any] | tuple[Any, ...]) -> int:
+    return int(conn.execute(sql, args).fetchone()[0] or 0)
+
+
+def _bounded_page(page: int, total: int, page_size: int) -> int:
+    page_count = max(1, math.ceil(total / page_size))
+    return min(max(1, page), page_count)
+
+
+def _group_counts(conn: sqlite3.Connection, sql: str, args: tuple[Any, ...]) -> dict[str, int]:
+    rows = conn.execute(sql, args).fetchall()
+    return {str(row["key"]): int(row["count"] or 0) for row in rows if row["key"] is not None}
+
+
+def _ordered_count_keys(counts: dict[str, int], order: tuple[str, ...]) -> list[str]:
+    ordered = list(order)
+    extras = sorted(key for key in counts if key not in ordered)
+    return ordered + extras
 
 
 def _raw_json_summary(raw: str | None) -> str:
@@ -888,6 +1666,30 @@ def _raw_json_summary(raw: str | None) -> str:
     if isinstance(data, list):
         return f"数组资料: {len(data)} 条"
     return f"资料类型: {type(data).__name__}"
+
+
+def _json_value_summary(raw: str | None) -> str:
+    if not raw:
+        return "-"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return str(raw)[:500]
+    if isinstance(data, dict):
+        parts = []
+        for key, value in list(data.items())[:12]:
+            if isinstance(value, dict):
+                display = f"对象({len(value)})"
+            elif isinstance(value, list):
+                display = f"数组({len(value)})"
+            else:
+                display = _display(value)
+            parts.append(f"{key}: {display}")
+        suffix = "" if len(data) <= 12 else f" ... 共 {len(data)} 字段"
+        return "；".join(parts) + suffix
+    if isinstance(data, list):
+        return f"数组({len(data)})"
+    return _display(data)
 
 
 def _badge(text: str, kind: str) -> str:
@@ -1247,6 +2049,78 @@ select {
   margin: 0 0 12px;
   font-size: 16px;
 }
+.panel h3 {
+  margin: 18px 0 10px;
+  font-size: 14px;
+}
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.section-head h2 {
+  margin: 0;
+}
+.tab-nav {
+  display: flex;
+  gap: 8px;
+  margin: 0 0 16px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--line);
+}
+.tab-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+  background: #f8faf9;
+  color: #4f5b55;
+  white-space: nowrap;
+}
+.tab-link.active {
+  background: var(--panel);
+  color: var(--green);
+  border-top: 3px solid var(--green);
+  font-weight: 750;
+}
+.scope-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+.scope-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: white;
+  color: #4f5b55;
+}
+.scope-chip.active {
+  border-color: var(--green);
+  background: var(--green-soft);
+  color: var(--green);
+  font-weight: 750;
+}
+.pill-count {
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #edf1ef;
+  color: #53605a;
+  font-size: 12px;
+  text-align: center;
+}
 .table-wrap {
   width: 100%;
   overflow-x: auto;
@@ -1381,6 +2255,27 @@ tbody tr:hover {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
+.metric-grid.compact {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-bottom: 10px;
+}
+.table-meta,
+.table-pager {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0 0;
+  color: var(--muted);
+}
+.table-pager nav {
+  display: flex;
+  gap: 6px;
+}
+.text-cell {
+  max-width: 360px;
+  overflow-wrap: anywhere;
+}
 .tag-row {
   display: flex;
   flex-wrap: wrap;
@@ -1418,7 +2313,8 @@ tbody tr:hover {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .summary-strip,
-  .detail-grid {
+  .detail-grid,
+  .metric-grid.compact {
     grid-template-columns: 1fr;
   }
 }
