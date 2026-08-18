@@ -167,6 +167,7 @@ mei1-crawler crawl-ego-batch \
   --end-page 126 \
   --window-pages 1 \
   --detail-per-page 20 \
+  --detail-batch-size 1 \
   --timeout 900
 ```
 
@@ -288,6 +289,7 @@ mei1-crawler crawl-ego-batch \
   --end-page 126 \
   --window-pages 1 \
   --detail-per-page 20 \
+  --detail-batch-size 1 \
   --timeout 900
 mei1-crawler rebuild-sync-state
 
@@ -312,6 +314,7 @@ done
 | `MEI1_FULL_END_PAGE` | `126` | 全量采集结束页 |
 | `MEI1_FULL_WINDOW_PAGES` | `1` | 全量采集每个窗口的页数 |
 | `MEI1_FULL_DETAIL_PER_PAGE` | `20` | 全量采集每页拉取详情数量；等于默认列表页大小时会抓该页全部详情 |
+| `MEI1_FULL_DETAIL_BATCH_SIZE` | `1` | 全量详情拉取分片大小；默认 1，避免 ego-lite 单次 evaluate 超时 |
 | `MEI1_INCREMENTAL_START_PAGE` | `1` | 增量扫描起始页 |
 | `MEI1_INCREMENTAL_PAGES` | `3` | 增量扫描页数 |
 | `MEI1_INCREMENTAL_WINDOW_PAGES` | `3` | 增量扫描每个窗口的页数 |

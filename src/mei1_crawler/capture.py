@@ -67,6 +67,7 @@ class ApiCapture:
         self.stats = CaptureStats()
         self._lock = threading.RLock()
         self._seen_member_source_ids: dict[str, int] = {}
+        self.list_page_source_member_ids: dict[int, list[str]] = {}
         self.detail_target_source_ids: list[str] = []
         self.detail_target_reasons: dict[str, str] = {}
 
@@ -190,8 +191,11 @@ class ApiCapture:
         for index, row in enumerate(rows):
             member = normalize_member(row, self.tenant_key)
             member_id = self.db.upsert_member(member)
-            if member.get("source_member_id"):
-                self._seen_member_source_ids[str(member["source_member_id"])] = member_id
+            source_member_id = member.get("source_member_id")
+            if source_member_id:
+                source_id = str(source_member_id)
+                self._seen_member_source_ids[source_id] = member_id
+                self.list_page_source_member_ids.setdefault(page_no, []).append(source_id)
             observation = normalize_list_observation(row, self.tenant_key, index)
             self.db.save_list_observation(
                 run_id=self.run_id,
@@ -207,9 +211,7 @@ class ApiCapture:
                 member_id=member_id,
                 row=observation,
             )
-            source_member_id = member.get("source_member_id")
             if change_type in {"new", "changed"} and source_member_id:
-                source_id = str(source_member_id)
                 if source_id not in self.detail_target_reasons:
                     self.detail_target_source_ids.append(source_id)
                     self.detail_target_reasons[source_id] = change_type

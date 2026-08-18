@@ -13,6 +13,7 @@ mei1-crawler crawl-ego-batch \
   --end-page "${MEI1_FULL_END_PAGE:-126}" \
   --window-pages "${MEI1_FULL_WINDOW_PAGES:-1}" \
   --detail-per-page "${MEI1_FULL_DETAIL_PER_PAGE:-20}" \
+  --detail-batch-size "${MEI1_FULL_DETAIL_BATCH_SIZE:-1}" \
   --timeout "${MEI1_EGO_TIMEOUT:-900}"
 
 mei1-crawler rebuild-sync-state

@@ -127,6 +127,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ego_batch_parser.add_argument("--page-size", type=int, default=20, help="Rows per member-list page.")
     ego_batch_parser.add_argument("--detail-per-page", type=int, default=2, help="Detail records to fetch per list page.")
+    ego_batch_parser.add_argument(
+        "--detail-batch-size",
+        type=int,
+        default=1,
+        help="Member detail records per ego-lite detail window. Keep small to avoid Runtime.evaluate timeouts.",
+    )
     ego_batch_parser.add_argument("--timeout", type=int, default=240, help="Seconds before aborting one ego-lite window.")
     ego_batch_parser.add_argument(
         "--allow-large",
@@ -283,12 +289,48 @@ def crawl_ego_batch(args: argparse.Namespace) -> int:
         last_page = current_page + pages - 1
         handoff_on_complete = last_page >= args.end_page
         print(f"[mei1-crawler] batch window {window_index}: pages {current_page}-{last_page}")
-        code = run_ego_window(
-            args,
-            start_page=current_page,
-            pages=pages,
-            handoff_on_complete=handoff_on_complete,
-        )
+
+        if args.detail_per_page > 0:
+            list_args = argparse.Namespace(**vars(args))
+            list_args.detail_per_page = 0
+            code, capture = run_ego_list_scan_window(list_args, start_page=current_page, pages=pages)
+            if code != 0:
+                print(f"[mei1-crawler] batch stopped at pages {current_page}-{last_page}", file=sys.stderr)
+                return code
+
+            detail_targets = detail_targets_from_list_capture(
+                capture,
+                start_page=current_page,
+                end_page=last_page,
+                detail_per_page=args.detail_per_page,
+            )
+            detail_batches = [
+                detail_targets[index : index + args.detail_batch_size]
+                for index in range(0, len(detail_targets), args.detail_batch_size)
+            ]
+            print(
+                "[mei1-crawler] batch detail targets "
+                f"members={len(detail_targets)} detail_batch_size={args.detail_batch_size}"
+            )
+            for detail_index, batch in enumerate(detail_batches, start=1):
+                print(f"[mei1-crawler] batch detail window {detail_index}/{len(detail_batches)}: members={len(batch)}")
+                detail_reasons = {source_id: "full" for source_id in batch}
+                code = run_ego_detail_window(
+                    args,
+                    member_ids=batch,
+                    detail_reasons=detail_reasons,
+                    handoff_on_complete=handoff_on_complete and detail_index == len(detail_batches),
+                )
+                if code != 0:
+                    print(f"[mei1-crawler] batch stopped at pages {current_page}-{last_page}", file=sys.stderr)
+                    return code
+        else:
+            code = run_ego_window(
+                args,
+                start_page=current_page,
+                pages=pages,
+                handoff_on_complete=handoff_on_complete,
+            )
         if code != 0:
             print(f"[mei1-crawler] batch stopped at pages {current_page}-{last_page}", file=sys.stderr)
             return code
@@ -296,6 +338,25 @@ def crawl_ego_batch(args: argparse.Namespace) -> int:
         window_index += 1
     print("[mei1-crawler] ego-lite batch completed")
     return 0
+
+
+def detail_targets_from_list_capture(
+    capture: ApiCapture,
+    *,
+    start_page: int,
+    end_page: int,
+    detail_per_page: int,
+) -> list[str]:
+    targets: list[str] = []
+    seen: set[str] = set()
+    for page_no in range(start_page, end_page + 1):
+        page_ids = capture.list_page_source_member_ids.get(page_no, [])
+        for source_id in page_ids[:detail_per_page]:
+            if source_id in seen:
+                continue
+            seen.add(source_id)
+            targets.append(source_id)
+    return targets
 
 
 def crawl_ego_incremental(args: argparse.Namespace) -> int:
@@ -603,6 +664,8 @@ def validate_ego_args(args: argparse.Namespace) -> str | None:
         return "--page-size must be between 1 and 100"
     if args.detail_per_page < 0:
         return "--detail-per-page must be >= 0"
+    if args.detail_batch_size < 1:
+        return "--detail-batch-size must be >= 1"
     if args.timeout <= 0:
         return "--timeout must be > 0"
     return None

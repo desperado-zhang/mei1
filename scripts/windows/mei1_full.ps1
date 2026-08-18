@@ -5,6 +5,7 @@ param(
     [int]$EndPage = 0,
     [int]$WindowPages = 0,
     [int]$DetailPerPage = 0,
+    [int]$DetailBatchSize = 0,
     [int]$TimeoutSeconds = 0,
     [string]$CondaEnv = ""
 )
@@ -22,6 +23,7 @@ $resolvedStartPage = Get-Mei1IntSetting -Value $StartPage -EnvName "MEI1_FULL_ST
 $resolvedEndPage = Get-Mei1IntSetting -Value $EndPage -EnvName "MEI1_FULL_END_PAGE" -Default 126
 $resolvedWindowPages = Get-Mei1IntSetting -Value $WindowPages -EnvName "MEI1_FULL_WINDOW_PAGES" -Default 1
 $resolvedDetailPerPage = Get-Mei1IntSetting -Value $DetailPerPage -EnvName "MEI1_FULL_DETAIL_PER_PAGE" -Default 20
+$resolvedDetailBatchSize = Get-Mei1IntSetting -Value $DetailBatchSize -EnvName "MEI1_FULL_DETAIL_BATCH_SIZE" -Default 1
 $resolvedTimeout = Get-Mei1IntSetting -Value $TimeoutSeconds -EnvName "MEI1_EGO_TIMEOUT" -Default 900
 
 Ensure-Mei1LogDir -ProjectDir $root | Out-Null
@@ -33,6 +35,7 @@ $fullArgs = @(
     "--end-page", [string]$resolvedEndPage,
     "--window-pages", [string]$resolvedWindowPages,
     "--detail-per-page", [string]$resolvedDetailPerPage,
+    "--detail-batch-size", [string]$resolvedDetailBatchSize,
     "--timeout", [string]$resolvedTimeout
 )
 Invoke-Mei1Native -Command "mei1-crawler" -Arguments $fullArgs
