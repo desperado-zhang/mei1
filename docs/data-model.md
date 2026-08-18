@@ -20,7 +20,8 @@ Default v1 excludes WeChat chat content. The tab exists in the detail drawer, bu
 
 - Every run and debug command must activate the local Miniconda environment first.
 - Python + SQLite is the persistence layer.
-- Python + Playwright is the browser layer.
+- Python + Playwright is the default browser layer.
+- ego-lite can also be used after manual login. The current `crawl-ego` path calls the Angular front-end `api.member` service in the logged-in page and then sends the resulting JSON through the same SQLite ingest path.
 - If Playwright detects an unauthenticated page, it should flash or focus the browser tab and wait until the user logs in and closes popups.
 - The crawler should deduplicate before writing, using stable source IDs when available and content hashes as fallback.
 - If a customer endpoint returns no-permission or unauthorized status/text, skip it and record a runtime event instead of storing the response payload.
@@ -76,6 +77,18 @@ Important keys:
 
 Append-only list-row observations per run. This preserves what each list page showed at crawl time, including ranking/order and row-level values.
 
+`row_content_hash` is the stable incremental fingerprint. It is built from normalized business fields such as member ID, member number, masked mobile, grade, card count, consume totals, visit counts, and last consume fields. It intentionally excludes page number, row index, and volatile encrypted display helpers such as `mobile_encryption`.
+
+### `member_sync_states` and `member_change_events`
+
+`member_sync_states` stores the latest known `row_content_hash` for each member. A sampled scan compares the current list hash with this table:
+
+- missing state: `new`
+- different hash: `changed`
+- same hash: `unchanged`
+
+`member_change_events` records `new` and `changed` detections. Incremental detail fetching is driven by these detections, so unchanged sampled rows do not trigger detail-page API calls.
+
 ### `member_asset_snapshots`
 
 Append-only snapshots for changing metrics:
@@ -98,6 +111,8 @@ Rows are deduplicated by `(member_id, snapshot_hash)`.
 ### `member_account_items`
 
 Cards, coupons, gifts, mall coupons, transferred items, and deposit items from the `会员帐户` tab.
+
+The current implementation extracts held cards from `GET /api/member/detailInfo/{memberId}` at `data.cards` and stores them as `item_scope = held_card`. Balance-like source fields can mean either times or money, so v1 preserves the display text and raw JSON, and only fills `balance_cents` when the source category indicates a stored-value card.
 
 Use `item_scope` to distinguish:
 
@@ -155,7 +170,7 @@ Preferred order:
 For member upsert:
 
 - Prefer unique index `ux_members_source_id`.
-- If no source ID is available, use `ux_members_member_no`.
+- If no source ID is available, use `ux_members_member_no`; do not let `member_no` override a stable source member ID.
 - Update `last_seen_at` on every successful observation.
 - Update normalized fields only when the new source value is non-empty.
 

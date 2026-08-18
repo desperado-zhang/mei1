@@ -45,6 +45,9 @@ data/tmp/
 data/attachments/
 
 # Playwright/test artifacts
+.playwright-cli/
+output/
+ui-blueprints/
 test-results/
 playwright-report/
 blob-report/

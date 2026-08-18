@@ -137,9 +137,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_members_source_id
 ON members (tenant_key, source_member_id)
 WHERE source_member_id IS NOT NULL AND source_member_id <> '';
 
+DROP INDEX IF EXISTS ux_members_member_no;
+
 CREATE UNIQUE INDEX IF NOT EXISTS ux_members_member_no
 ON members (tenant_key, member_no)
-WHERE member_no IS NOT NULL AND member_no <> '';
+WHERE (source_member_id IS NULL OR source_member_id = '')
+  AND member_no IS NOT NULL
+  AND member_no <> '';
 
 CREATE INDEX IF NOT EXISTS ix_members_name ON members (tenant_key, name);
 CREATE INDEX IF NOT EXISTS ix_members_mobile_hash ON members (tenant_key, mobile_sha256);
@@ -152,6 +156,7 @@ CREATE TABLE IF NOT EXISTS member_list_observations (
   member_id INTEGER REFERENCES members(id) ON DELETE SET NULL,
   row_index INTEGER NOT NULL,
   row_fingerprint TEXT NOT NULL,
+  row_content_hash TEXT,
   source_member_id TEXT,
   member_no TEXT,
   name TEXT,
@@ -172,6 +177,51 @@ CREATE TABLE IF NOT EXISTS member_list_observations (
 
 CREATE INDEX IF NOT EXISTS ix_member_list_observations_member
 ON member_list_observations (member_id, observed_at);
+
+CREATE TABLE IF NOT EXISTS member_sync_states (
+  member_id INTEGER PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
+  tenant_key TEXT NOT NULL REFERENCES tenant_contexts(tenant_key) ON UPDATE CASCADE,
+  source_member_id TEXT,
+  member_no TEXT,
+  last_list_content_hash TEXT NOT NULL,
+  list_seen_count INTEGER NOT NULL DEFAULT 1,
+  first_seen_run_id INTEGER REFERENCES crawl_runs(id) ON DELETE SET NULL,
+  last_seen_run_id INTEGER REFERENCES crawl_runs(id) ON DELETE SET NULL,
+  last_changed_run_id INTEGER REFERENCES crawl_runs(id) ON DELETE SET NULL,
+  last_detail_reason TEXT,
+  detail_requested_at TEXT,
+  first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  last_changed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_member_sync_states_source
+ON member_sync_states (tenant_key, source_member_id)
+WHERE source_member_id IS NOT NULL AND source_member_id <> '';
+
+CREATE INDEX IF NOT EXISTS ix_member_sync_states_seen
+ON member_sync_states (tenant_key, last_seen_at);
+
+CREATE TABLE IF NOT EXISTS member_change_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER REFERENCES crawl_runs(id) ON DELETE SET NULL,
+  tenant_key TEXT NOT NULL REFERENCES tenant_contexts(tenant_key) ON UPDATE CASCADE,
+  member_id INTEGER REFERENCES members(id) ON DELETE CASCADE,
+  source_member_id TEXT,
+  member_no TEXT,
+  change_type TEXT NOT NULL,
+  previous_hash TEXT,
+  current_hash TEXT NOT NULL,
+  raw_row_json TEXT CHECK (raw_row_json IS NULL OR json_valid(raw_row_json)),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  CHECK (change_type IN ('new', 'changed'))
+);
+
+CREATE INDEX IF NOT EXISTS ix_member_change_events_run
+ON member_change_events (run_id, change_type);
+
+CREATE INDEX IF NOT EXISTS ix_member_change_events_member
+ON member_change_events (member_id, created_at);
 
 CREATE TABLE IF NOT EXISTS member_tags (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -196,6 +196,23 @@ def normalize_list_observation(row: JsonDict, tenant_key: str, row_index: int) -
             "raw": row,
         }
     )
+    raw["row_content_hash"] = sha256_json(
+        {
+            "source_member_id": raw["source_member_id"],
+            "member_no": raw["member_no"],
+            "name": raw["name"],
+            "mobile_masked": raw["mobile_masked"],
+            "grade_name": raw["grade_name"],
+            "card_count": raw["card_count"],
+            "stored_value_balance_cents": raw["stored_value_balance_cents"],
+            "total_consume_cents": raw["total_consume_cents"],
+            "total_visit_count": raw["total_visit_count"],
+            "current_month_visit_count": raw["current_month_visit_count"],
+            "last_consume_at": raw["last_consume_at"],
+            "last_service_employee_name": raw["last_service_employee_name"],
+            "last_consume_amount_cents": raw["last_consume_amount_cents"],
+        }
+    )
     return raw
 
 
@@ -227,6 +244,62 @@ def normalize_asset_snapshot(payload: Any, member_id: int) -> JsonDict:
     }
     row["snapshot_hash"] = sha256_json(data)
     return row
+
+
+def extract_account_items(payload: Any) -> list[JsonDict]:
+    data = extract_data(payload)
+    if isinstance(data, dict):
+        for key in ("cards", "cardList", "holderCards", "memberCards"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+
+    best: list[JsonDict] = []
+    best_score = 0
+    for candidate in _walk_lists(data):
+        if not candidate or not all(isinstance(item, dict) for item in candidate[: min(5, len(candidate))]):
+            continue
+        score = sum(_account_item_score(item) for item in candidate[: min(5, len(candidate))])
+        if score > best_score:
+            best = [item for item in candidate if isinstance(item, dict)]
+            best_score = score
+    return best if best_score >= 2 else []
+
+
+def normalize_account_item(row: JsonDict, member_id: int) -> JsonDict:
+    balance_text = _first_str(row, "balance", "remainTimes", "remainingTimes", "remainCount", "remainingCount")
+    deposit_text = _first_str(row, "deposit", "totalTimes", "times", "totalCount")
+    remaining_times_text = None
+    if balance_text and deposit_text:
+        remaining_times_text = f"{balance_text}/{deposit_text}"
+    elif balance_text:
+        remaining_times_text = balance_text
+
+    valid_to = _first_str(row, "endTime", "invalidDate", "validEndTime", "expireTime", "expiredAt")
+    return {
+        "member_id": member_id,
+        "item_scope": "held_card",
+        "source_item_id": _first_str(row, "id", "cardId", "holderCardId", "memberCardId"),
+        "item_no": _first_str(row, "cardNo", "cardCode", "no", "code"),
+        "item_name": _first_str(row, "name", "cardName", "itemName"),
+        "item_type": _account_item_type(row),
+        "status": _first_str(row, "status", "cardStatus", "state", "delFlag"),
+        "source_name": _first_str(row, "sourceName", "merchantName", "storeName", "belongStoreName"),
+        "valid_from": _first_str(row, "activeDate", "startTime", "validStartTime", "createTime", "createdAt"),
+        "valid_to": valid_to,
+        "is_permanent": _normalize_bool(_first(row, "isPermanent", "permanent"))
+        if _first(row, "isPermanent", "permanent") is not None
+        else int(valid_to is None),
+        "deal_price_cents": _money_cents(
+            _first(row, "dealPrice", "price", "paidCardPrice", "fixedCardMoney", "realMoney", "buyMoney")
+        ),
+        "remaining_times_text": remaining_times_text,
+        "balance_cents": _money_cents(_first(row, "balance", "cardBalance", "remainMoney"))
+        if _is_stored_value_card(row)
+        else None,
+        "display_balance_text": balance_text,
+        "raw_json": row,
+    }
 
 
 def _rows_from_common_shapes(value: Any) -> list[JsonDict]:
@@ -282,6 +355,48 @@ def _member_row_score(row: JsonDict) -> int:
         if keys.intersection(names):
             score += 1
     return score
+
+
+def _account_item_score(row: JsonDict) -> int:
+    keys = set(row)
+    score = 0
+    for names in (
+        {"id", "cardId", "holderCardId", "memberCardId"},
+        {"cardNo", "cardCode", "no", "code"},
+        {"name", "cardName", "itemName"},
+        {"balance", "deposit", "remainTimes", "remainingTimes"},
+        {"kind", "categoryLevel", "holderCardType", "cardType"},
+    ):
+        if keys.intersection(names):
+            score += 1
+    return score
+
+
+def _account_item_type(row: JsonDict) -> str | None:
+    label = _first_str(row, "categoryLevelName", "cardTypeName", "kindName", "typeName")
+    if label:
+        return label
+    parts = []
+    for key in ("kind", "categoryLevel", "holderCardType", "cardType"):
+        value = _first_str(row, key)
+        if value:
+            parts.append(f"{key}:{value}")
+    return "|".join(parts) or None
+
+
+def _is_stored_value_card(row: JsonDict) -> bool:
+    category = _first_str(row, "categoryLevel")
+    if category == "CD00100001":
+        return True
+    text = " ".join(
+        value
+        for value in (
+            _first_str(row, "categoryLevelName", "cardTypeName", "kindName", "typeName", "name", "cardName"),
+            _first_str(row, "kind", "cardType", "holderCardType"),
+        )
+        if value
+    )
+    return bool(re.search(r"储值|充值|现金|wallet|stored|value|cash", text, re.I))
 
 
 def _first(row: JsonDict, *keys: str) -> Any:

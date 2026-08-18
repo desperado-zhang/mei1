@@ -14,10 +14,12 @@ from .db import Database
 from .parser import (
     LIST_ENDPOINT,
     endpoint_path,
+    extract_account_items,
     extract_member_profile,
     extract_rows,
     extract_total_count,
     is_member_endpoint,
+    normalize_account_item,
     normalize_asset_snapshot,
     normalize_list_observation,
     normalize_member,
@@ -33,6 +35,11 @@ class CaptureStats:
     members_upserted: int = 0
     detail_profiles: int = 0
     asset_snapshots: int = 0
+    account_items: int = 0
+    new_members: int = 0
+    changed_members: int = 0
+    unchanged_members: int = 0
+    unknown_change_members: int = 0
     ignored_non_json: int = 0
     skipped_permission_denied: int = 0
     errors: list[str] = field(default_factory=list)
@@ -46,6 +53,8 @@ class ApiCapture:
         self.stats = CaptureStats()
         self._lock = threading.RLock()
         self._seen_member_source_ids: dict[str, int] = {}
+        self.detail_target_source_ids: list[str] = []
+        self.detail_target_reasons: dict[str, str] = {}
 
     def attach(self, page: Page) -> None:
         page.on("response", self._on_response)
@@ -74,39 +83,65 @@ class ApiCapture:
                 with self._lock:
                     self.stats.ignored_non_json += 1
                 return
-            if _looks_permission_denied(payload):
-                self._record_permission_skip(path, response.status)
-                return
-
-            request_body = self._request_body(request)
-            source_payload_id = self.db.save_source_payload(
-                run_id=self.run_id,
-                tenant_key=self.tenant_key,
-                page_area=page_area_for_endpoint(path),
+            self.process_payload(
                 method=request.method,
                 endpoint=path,
                 request_url=response.url,
                 request_params=dict(parse_qsl(urlparse(response.url).query)),
-                request_body=request_body,
+                request_body=self._request_body(request),
                 status_code=response.status,
                 response_json=payload,
             )
-            with self._lock:
-                self.stats.source_payloads += 1
-
-            if path == LIST_ENDPOINT:
-                self._save_member_list(payload, request_body, source_payload_id)
-            elif path.startswith(("/api/member/detailInfo/", "/api/member/detail/")):
-                self._save_member_profile(path, payload)
-            elif path.startswith("/api/member/amount/"):
-                self._save_asset_snapshot(path, payload)
         except Exception as exc:  # noqa: BLE001 - browser event callbacks must not crash the run.
             message = f"{type(exc).__name__}: {exc}"
             with self._lock:
                 self.stats.errors.append(message)
             self.db.add_event(self.run_id, "capture_error", message)
 
-    def _record_permission_skip(self, path: str, status_code: int) -> None:
+    def process_payload(
+        self,
+        *,
+        method: str,
+        endpoint: str,
+        request_url: str,
+        request_params: Any = None,
+        request_body: Any = None,
+        status_code: int | None = None,
+        response_json: Any = None,
+    ) -> None:
+        path = endpoint_path(endpoint)
+        if not is_member_endpoint(path):
+            return
+        if status_code in {401, 403}:
+            self._record_permission_skip(path, status_code)
+            return
+        if _looks_permission_denied(response_json):
+            self._record_permission_skip(path, status_code)
+            return
+
+        source_payload_id = self.db.save_source_payload(
+            run_id=self.run_id,
+            tenant_key=self.tenant_key,
+            page_area=page_area_for_endpoint(path),
+            method=method,
+            endpoint=path,
+            request_url=request_url,
+            request_params=request_params,
+            request_body=request_body,
+            status_code=status_code,
+            response_json=response_json,
+        )
+        with self._lock:
+            self.stats.source_payloads += 1
+
+        if path == LIST_ENDPOINT:
+            self._save_member_list(response_json, request_body, source_payload_id)
+        elif path.startswith(("/api/member/detailInfo/", "/api/member/detail/")):
+            self._save_member_profile(path, response_json)
+        elif path.startswith("/api/member/amount/"):
+            self._save_asset_snapshot(path, response_json)
+
+    def _record_permission_skip(self, path: str, status_code: int | None) -> None:
         with self._lock:
             self.stats.skipped_permission_denied += 1
         self.db.add_event(self.run_id, "permission_denied", f"Skipped permission-denied endpoint: {path}", {"status": status_code})
@@ -140,6 +175,27 @@ class ApiCapture:
                 row=observation,
                 row_index=index,
             )
+            change_type = self.db.record_member_scan_state(
+                run_id=self.run_id,
+                tenant_key=self.tenant_key,
+                member_id=member_id,
+                row=observation,
+            )
+            source_member_id = member.get("source_member_id")
+            if change_type in {"new", "changed"} and source_member_id:
+                source_id = str(source_member_id)
+                if source_id not in self.detail_target_reasons:
+                    self.detail_target_source_ids.append(source_id)
+                    self.detail_target_reasons[source_id] = change_type
+            with self._lock:
+                if change_type == "new":
+                    self.stats.new_members += 1
+                elif change_type == "changed":
+                    self.stats.changed_members += 1
+                elif change_type == "unchanged":
+                    self.stats.unchanged_members += 1
+                else:
+                    self.stats.unknown_change_members += 1
         with self._lock:
             self.stats.list_pages += 1
             self.stats.list_rows += len(rows)
@@ -155,6 +211,11 @@ class ApiCapture:
         member = normalize_member(profile, self.tenant_key)
         member_id = self.db.upsert_member(member)
         self.db.mark_member_detail_seen(member_id)
+        for account_row in extract_account_items(payload):
+            account_item = normalize_account_item(account_row, member_id)
+            self.db.save_account_item(account_item)
+            with self._lock:
+                self.stats.account_items += 1
         if source_id:
             self._seen_member_source_ids[str(source_id)] = member_id
         with self._lock:
@@ -203,7 +264,7 @@ def _member_id_from_path(path: str) -> str | None:
 
 def _looks_permission_denied(payload: Any) -> bool:
     text = _payload_text(payload)
-    return bool(re.search(r"无权限|没有权限|权限不足|未授权|未登录|unauthorized|forbidden|permission denied", text, re.I))
+    return bool(re.search(r"无权限|没有.*权限|权限不足|未授权|未登录|unauthorized|forbidden|permission denied", text, re.I))
 
 
 def _payload_text(value: Any) -> str:

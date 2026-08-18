@@ -25,6 +25,13 @@ class Database:
 
     def init_schema(self) -> None:
         self.conn.executescript(SCHEMA_PATH.read_text())
+        self._ensure_column("member_list_observations", "row_content_hash", "TEXT")
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS ix_member_list_observations_content_hash
+            ON member_list_observations (member_id, row_content_hash)
+            """
+        )
         self.conn.commit()
 
     def upsert_tenant(
@@ -269,7 +276,12 @@ class Database:
             conflict_clause = "ON CONFLICT(tenant_key, source_member_id) WHERE source_member_id IS NOT NULL AND source_member_id <> ''"
         elif member.get("member_no"):
             conflict_key = "member_no"
-            conflict_clause = "ON CONFLICT(tenant_key, member_no) WHERE member_no IS NOT NULL AND member_no <> ''"
+            conflict_clause = """
+                ON CONFLICT(tenant_key, member_no)
+                WHERE (source_member_id IS NULL OR source_member_id = '')
+                  AND member_no IS NOT NULL
+                  AND member_no <> ''
+            """
         else:
             conflict_clause = None
 
@@ -296,7 +308,12 @@ class Database:
             ).fetchone()
         elif conflict_key == "member_no":
             row = self.conn.execute(
-                "SELECT id FROM members WHERE tenant_key = ? AND member_no = ?",
+                """
+                SELECT id FROM members
+                WHERE tenant_key = ?
+                  AND member_no = ?
+                  AND (source_member_id IS NULL OR source_member_id = '')
+                """,
                 (member["tenant_key"], member["member_no"]),
             ).fetchone()
         else:
@@ -321,6 +338,7 @@ class Database:
             "member_id",
             "row_index",
             "row_fingerprint",
+            "row_content_hash",
             "source_member_id",
             "member_no",
             "name",
@@ -352,6 +370,204 @@ class Database:
             [self._db_value(payload.get(column)) for column in columns],
         )
         self.conn.commit()
+
+    def record_member_scan_state(
+        self,
+        *,
+        run_id: int,
+        tenant_key: str,
+        member_id: int,
+        row: dict[str, Any],
+    ) -> str:
+        current_hash = row.get("row_content_hash")
+        if not current_hash:
+            return "unknown"
+
+        existing = self.conn.execute(
+            """
+            SELECT last_list_content_hash
+            FROM member_sync_states
+            WHERE member_id = ?
+            """,
+            (member_id,),
+        ).fetchone()
+        source_member_id = row.get("source_member_id")
+        member_no = row.get("member_no")
+        raw_row_json = row.get("raw_row_json")
+
+        if existing is None:
+            self.conn.execute(
+                """
+                INSERT INTO member_sync_states (
+                  member_id, tenant_key, source_member_id, member_no,
+                  last_list_content_hash, first_seen_run_id, last_seen_run_id,
+                  last_changed_run_id, list_seen_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (member_id, tenant_key, source_member_id, member_no, current_hash, run_id, run_id, run_id),
+            )
+            self._insert_member_change_event(
+                run_id=run_id,
+                tenant_key=tenant_key,
+                member_id=member_id,
+                source_member_id=source_member_id,
+                member_no=member_no,
+                change_type="new",
+                previous_hash=None,
+                current_hash=current_hash,
+                raw_row_json=raw_row_json,
+            )
+            self.conn.commit()
+            return "new"
+
+        previous_hash = existing["last_list_content_hash"]
+        if previous_hash != current_hash:
+            self.conn.execute(
+                """
+                UPDATE member_sync_states
+                SET source_member_id = COALESCE(?, source_member_id),
+                    member_no = COALESCE(?, member_no),
+                    last_list_content_hash = ?,
+                    list_seen_count = list_seen_count + 1,
+                    last_seen_run_id = ?,
+                    last_changed_run_id = ?,
+                    last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    last_changed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE member_id = ?
+                """,
+                (source_member_id, member_no, current_hash, run_id, run_id, member_id),
+            )
+            self._insert_member_change_event(
+                run_id=run_id,
+                tenant_key=tenant_key,
+                member_id=member_id,
+                source_member_id=source_member_id,
+                member_no=member_no,
+                change_type="changed",
+                previous_hash=previous_hash,
+                current_hash=current_hash,
+                raw_row_json=raw_row_json,
+            )
+            self.conn.commit()
+            return "changed"
+
+        self.conn.execute(
+            """
+            UPDATE member_sync_states
+            SET source_member_id = COALESCE(?, source_member_id),
+                member_no = COALESCE(?, member_no),
+                list_seen_count = list_seen_count + 1,
+                last_seen_run_id = ?,
+                last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE member_id = ?
+            """,
+            (source_member_id, member_no, run_id, member_id),
+        )
+        self.conn.commit()
+        return "unchanged"
+
+    def mark_detail_requested(self, member_id: int, reason: str) -> None:
+        self.conn.execute(
+            """
+            UPDATE member_sync_states
+            SET last_detail_reason = ?,
+                detail_requested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE member_id = ?
+            """,
+            (reason, member_id),
+        )
+        self.conn.commit()
+
+    def rebuild_sync_state_from_observations(self) -> int:
+        rows = self.conn.execute(
+            """
+            SELECT
+              o.member_id,
+              o.tenant_key,
+              o.source_member_id,
+              o.member_no,
+              o.row_content_hash,
+              o.run_id,
+              o.observed_at
+            FROM member_list_observations o
+            JOIN (
+              SELECT member_id, max(observed_at) AS max_observed_at
+              FROM member_list_observations
+              WHERE member_id IS NOT NULL
+                AND row_content_hash IS NOT NULL
+              GROUP BY member_id
+            ) latest
+              ON latest.member_id = o.member_id
+             AND latest.max_observed_at = o.observed_at
+            WHERE o.member_id IS NOT NULL
+              AND o.row_content_hash IS NOT NULL
+            """
+        ).fetchall()
+        for row in rows:
+            self.conn.execute(
+                """
+                INSERT INTO member_sync_states (
+                  member_id, tenant_key, source_member_id, member_no,
+                  last_list_content_hash, first_seen_run_id, last_seen_run_id,
+                  last_changed_run_id, first_seen_at, last_seen_at, last_changed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(member_id) DO UPDATE SET
+                  tenant_key = excluded.tenant_key,
+                  source_member_id = COALESCE(excluded.source_member_id, member_sync_states.source_member_id),
+                  member_no = COALESCE(excluded.member_no, member_sync_states.member_no),
+                  last_list_content_hash = excluded.last_list_content_hash,
+                  last_seen_run_id = excluded.last_seen_run_id,
+                  last_seen_at = excluded.last_seen_at
+                """,
+                (
+                    row["member_id"],
+                    row["tenant_key"],
+                    row["source_member_id"],
+                    row["member_no"],
+                    row["row_content_hash"],
+                    row["run_id"],
+                    row["run_id"],
+                    row["run_id"],
+                    row["observed_at"],
+                    row["observed_at"],
+                    row["observed_at"],
+                ),
+            )
+        self.conn.commit()
+        return len(rows)
+
+    def backfill_list_content_hashes(self, *, force: bool = False) -> int:
+        from .parser import normalize_list_observation
+
+        predicate = "raw_row_json IS NOT NULL" if force else "row_content_hash IS NULL AND raw_row_json IS NOT NULL"
+        rows = self.conn.execute(
+            f"""
+            SELECT id, tenant_key, row_index, raw_row_json
+            FROM member_list_observations
+            WHERE {predicate}
+            """
+        ).fetchall()
+        for row in rows:
+            raw_row = json.loads(row["raw_row_json"])
+            normalized = normalize_list_observation(raw_row, row["tenant_key"], int(row["row_index"]))
+            self.conn.execute(
+                """
+                UPDATE member_list_observations
+                SET row_content_hash = ?
+                WHERE id = ?
+                """,
+                (normalized.get("row_content_hash"), row["id"]),
+            )
+        self.conn.commit()
+        return len(rows)
+
+    def sync_state_counts(self) -> dict[str, int]:
+        return {
+            "member_sync_states": int(self.conn.execute("SELECT count(*) FROM member_sync_states").fetchone()[0]),
+            "member_change_events": int(self.conn.execute("SELECT count(*) FROM member_change_events").fetchone()[0]),
+        }
 
     def save_asset_snapshot(self, run_id: int, snapshot: dict[str, Any]) -> None:
         columns = [
@@ -387,6 +603,85 @@ class Database:
             [self._db_value(payload.get(column)) for column in columns],
         )
         self.conn.commit()
+
+    def save_account_item(self, item: dict[str, Any]) -> int:
+        columns = [
+            "member_id",
+            "item_scope",
+            "source_item_id",
+            "item_no",
+            "item_name",
+            "item_type",
+            "status",
+            "source_name",
+            "valid_from",
+            "valid_to",
+            "is_permanent",
+            "deal_price_cents",
+            "remaining_times_text",
+            "balance_cents",
+            "display_balance_text",
+            "raw_json",
+        ]
+        values = [self._db_value(item.get(column)) for column in columns]
+        placeholders = ", ".join("?" for _ in columns)
+        assignments = ", ".join(
+            f"{column} = COALESCE(excluded.{column}, member_account_items.{column})"
+            for column in columns
+            if column not in {"member_id", "item_scope", "source_item_id", "item_no"}
+        )
+
+        if item.get("source_item_id"):
+            conflict_clause = """
+                ON CONFLICT(member_id, item_scope, source_item_id)
+                WHERE source_item_id IS NOT NULL AND source_item_id <> ''
+            """
+        elif item.get("item_no"):
+            conflict_clause = """
+                ON CONFLICT(member_id, item_scope, item_no)
+                WHERE item_no IS NOT NULL AND item_no <> ''
+            """
+        else:
+            conflict_clause = None
+
+        if conflict_clause:
+            self.conn.execute(
+                f"""
+                INSERT INTO member_account_items ({", ".join(columns)})
+                VALUES ({placeholders})
+                {conflict_clause}
+                DO UPDATE SET
+                  {assignments},
+                  last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                """,
+                values,
+            )
+        else:
+            self.conn.execute(
+                f"INSERT INTO member_account_items ({', '.join(columns)}) VALUES ({placeholders})",
+                values,
+            )
+
+        if item.get("source_item_id"):
+            row = self.conn.execute(
+                """
+                SELECT id FROM member_account_items
+                WHERE member_id = ? AND item_scope = ? AND source_item_id = ?
+                """,
+                (item["member_id"], item["item_scope"], item["source_item_id"]),
+            ).fetchone()
+        elif item.get("item_no"):
+            row = self.conn.execute(
+                """
+                SELECT id FROM member_account_items
+                WHERE member_id = ? AND item_scope = ? AND item_no = ?
+                """,
+                (item["member_id"], item["item_scope"], item["item_no"]),
+            ).fetchone()
+        else:
+            row = self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()
+        self.conn.commit()
+        return int(row["id"])
 
     def find_member_id(
         self,
@@ -428,6 +723,9 @@ class Database:
             "members",
             "member_list_observations",
             "member_asset_snapshots",
+            "member_account_items",
+            "member_sync_states",
+            "member_change_events",
         ]
         return {
             table: int(self.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
@@ -438,6 +736,45 @@ class Database:
         if isinstance(value, (dict, list)):
             return _json(value)
         return value
+
+    def _insert_member_change_event(
+        self,
+        *,
+        run_id: int,
+        tenant_key: str,
+        member_id: int,
+        source_member_id: str | None,
+        member_no: str | None,
+        change_type: str,
+        previous_hash: str | None,
+        current_hash: str,
+        raw_row_json: Any,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO member_change_events (
+              run_id, tenant_key, member_id, source_member_id, member_no,
+              change_type, previous_hash, current_hash, raw_row_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                tenant_key,
+                member_id,
+                source_member_id,
+                member_no,
+                change_type,
+                previous_hash,
+                current_hash,
+                _json(raw_row_json),
+            ),
+        )
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _json(value: Any) -> str | None:
